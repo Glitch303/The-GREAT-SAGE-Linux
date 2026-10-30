@@ -6,9 +6,10 @@ installer decides what to act on; this module only reports.
 
 Three of Great Sage's dependencies cannot travel inside the application:
 
-  Ollama          a separate background service, installed system-wide
-  the chat model  ~1.9GB, managed by Ollama in its own store
-  WebView2        the Microsoft runtime the HUD window renders through
+  the model server  llama.cpp's llama-server (or a router such as
+                    llama-swap in front of it), run as a background process
+  the chat model    a GGUF the server loads, in its own model store
+  WebKitGTK         the system web engine the HUD window renders through
 
 A fourth, the voice model weights, CAN be bundled but usually should not
 be: ~3.6GB that F5-TTS and Whisper fetch on first use anyway.
@@ -19,17 +20,16 @@ error. `blocking` marks the ones without which the app genuinely cannot
 work, as opposed to those that only cost speed or polish.
 """
 
+import importlib
 import os
-import shutil
-import sys
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 from great_sage.config import settings
 
-OLLAMA_DOWNLOAD = "https://ollama.com/download/OllamaSetup.exe"
-WEBVIEW2_DOWNLOAD = ("https://go.microsoft.com/fwlink/p/?LinkId=2124703")
+LLAMA_DOWNLOAD = "https://github.com/ggml-org/llama.cpp/releases"
 
 
 @dataclass
@@ -57,94 +57,107 @@ def _run(cmd, timeout=10):
         return 1, str(exc)
 
 
-def check_ollama_installed() -> Requirement:
-    exe = shutil.which("ollama")
-    if not exe:
-        # Installed-but-not-on-PATH is common enough to be worth catching,
-        # otherwise a user who has it gets told to install it again.
-        guess = os.path.expandvars(r"%LOCALAPPDATA%\Programs\Ollama\ollama.exe")
-        if os.path.exists(guess):
-            exe = guess
-    return Requirement(
-        key="ollama",
-        label="Ollama runtime",
-        ok=bool(exe),
-        detail=exe or "not found on PATH or in the default install location",
-        fix_url=OLLAMA_DOWNLOAD,
-        fix_hint="Download and run the installer, then come back and re-check.",
-        size_hint="~700 MB",
-    )
+def _server_url() -> str:
+    return settings.LLM_BASE_URL.rstrip("/")
 
 
-def check_ollama_running() -> Requirement:
-    """Is the service actually answering? Installed but stopped is a real
-    state - the app would otherwise fail only on the first message."""
-    reachable, detail = False, "no response on " + settings.OLLAMA_HOST
+def _server_headers() -> dict:
+    return ({"Authorization": "Bearer " + settings.LLM_API_KEY}
+            if settings.LLM_API_KEY else {})
+
+
+def check_llama_server() -> Requirement:
+    """Is the local model server answering?
+
+    One HTTP check covers both "installed" and "running" - over the wire
+    the two states are indistinguishable, and the fix for both is the
+    same: start the server. A 401 is the interesting state: the server
+    IS up, and the key in the settings is what is wrong."""
+    base = _server_url()
     try:
         import requests
-        r = requests.get(settings.OLLAMA_HOST + "/api/tags", timeout=3)
+        r = requests.get(base + "/v1/models", headers=_server_headers(),
+                         timeout=3)
+        if r.status_code == 401:
+            return Requirement(
+                key="llama_server", label="llama.cpp server", ok=False,
+                detail=f"up at {base}, but it rejected the API key",
+                fix_hint="Check LLM_API_KEY in settings.local.py against "
+                         "the apiKeys in the server's config.",
+            )
         reachable = r.status_code == 200
-        detail = f"responding ({settings.OLLAMA_HOST})" if reachable \
-            else f"HTTP {r.status_code}"
+        detail = f"responding ({base})" if reachable else f"HTTP {r.status_code}"
     except Exception as exc:
-        detail = f"{type(exc).__name__}: {exc}"[:90]
+        reachable, detail = False, f"{type(exc).__name__} at {base}"
     return Requirement(
-        key="ollama_running", label="Ollama service", ok=reachable, detail=detail,
-        fix_command=["ollama", "serve"],
-        fix_hint="Ollama normally starts with Windows. Launch it once by hand "
-                 "if this stays red.",
+        key="llama_server", label="llama.cpp server", ok=reachable,
+        detail=detail, fix_url=LLAMA_DOWNLOAD,
+        fix_hint="Install llama.cpp and run `llama-server -m <model.gguf>` "
+                 "(it listens on port 8080 by default), or start your "
+                 "router (llama-swap) and point LLM_BASE_URL at it.",
     )
 
 
 def check_model() -> Requirement:
-    """Is the configured chat model pulled?"""
-    want = settings.OLLAMA_DEFAULT_MODEL
-    found, detail = False, "could not query Ollama"
+    """Is the configured chat model available on the server?
+
+    An empty LLM_DEFAULT_MODEL means "the first model the server
+    reports", so any non-empty list satisfies the check."""
+    want = settings.LLM_DEFAULT_MODEL
+    found, detail = False, "could not query the server"
     try:
         import requests
-        r = requests.get(settings.OLLAMA_HOST + "/api/tags", timeout=5)
+        r = requests.get(_server_url() + "/v1/models",
+                         headers=_server_headers(), timeout=5)
         if r.status_code == 200:
-            names = [m.get("name", "") for m in r.json().get("models", [])]
-            # Ollama reports "qwen2.5:3b"; a bare "qwen2.5" should still match.
-            found = any(n == want or n.split(":")[0] == want.split(":")[0]
-                        for n in names)
+            names = [m.get("id", "") for m in r.json().get("data", [])]
+            names = [n for n in names if n]
+            found = bool(names) and (not want or want in names)
             detail = ("installed" if found
-                      else ("installed models: " + (", ".join(names) or "none")))
+                      else ("models on server: " + (", ".join(names) or "none")))
     except Exception as exc:
         detail = f"{type(exc).__name__}"
     return Requirement(
-        key="model", label=f"Chat model ({want})", ok=found, detail=detail,
-        fix_command=["ollama", "pull", want],
-        fix_hint="Downloads once, then works offline.",
-        size_hint="~1.9 GB",
+        key="model",
+        label=f"Chat model ({want or 'first reported'})",
+        ok=found, detail=detail,
+        fix_hint="Load a GGUF into the server (llama-server -m ...), or "
+                 "set LLM_DEFAULT_MODEL in settings.local.py to one of the "
+                 "names above.",
     )
 
 
-def check_webview2() -> Requirement:
-    """The runtime the HUD window renders through.
+def check_webview() -> Requirement:
+    """The web engine the HUD window renders through.
 
-    Present on essentially every up-to-date Windows 11, but a fresh or
-    LTSC install can lack it, and without it the window never appears -
-    which looks like the app silently doing nothing.
-    """
+    On Linux pywebview hosts WebKitGTK (a system package, not a pip one),
+    and without it the window never appears - which looks like the app
+    silently doing nothing. The import probe is the honest check: it is
+    exactly what pywebview does when the window is created."""
     present, detail = False, "not detected"
-    keys = [
-        r"HKLM\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients"
-        r"\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",
-        r"HKCU\SOFTWARE\Microsoft\EdgeUpdate\Clients"
-        r"\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",
-    ]
-    for k in keys:
-        rc, out = _run(["reg", "query", k, "/v", "pv"])
-        if rc == 0 and "pv" in out:
-            present = True
-            detail = "version " + out.split()[-1]
-            break
+    try:
+        import gi
+        # WebKitGTK 6.0 (GTK4) uses the WebKit namespace; 4.x, the one
+        # most distros still ship, uses WebKit2.
+        for ns, ver in (("WebKit", "6.0"), ("WebKit2", "4.1"),
+                        ("WebKit2", "4.0")):
+            try:
+                gi.require_version(ns, ver)
+                mod = importlib.import_module("gi.repository." + ns)
+                present = True
+                detail = f"{ns} {ver} ({getattr(mod, '_version', ver)})"
+                break
+            except Exception:
+                continue
+    except Exception as exc:
+        detail = f"python3-gi missing ({type(exc).__name__})"
     return Requirement(
-        key="webview2", label="Microsoft WebView2 runtime", ok=present,
-        detail=detail, fix_url=WEBVIEW2_DOWNLOAD,
-        fix_hint="Ships with Windows 11; only needed on older or stripped installs.",
-        size_hint="~150 MB",
+        key="webview", label="WebKitGTK (HUD renderer)", ok=present,
+        detail=detail,
+        fix_hint="Install the system packages: libwebkit2gtk-4.1-0 and "
+                 "gir1.2-webkit2-4.1 (or the webkitgtk-6.0 equivalents), "
+                 "plus python3-gi.",
+        size_hint="~200 MB",
     )
 
 
@@ -201,7 +214,10 @@ def check_voice_weights() -> Requirement:
 
 
 def check_overlay_host() -> Requirement:
-    """PySide6, which the transparent overlay runs on.
+    """The host the transparent overlay runs in.
+
+    On Linux that is the layer-shell binary in overlay/ (Phase 2); on
+    Windows it is PySide6, which overlay_window.py runs on.
 
     NOT blocking: the main window is pywebview and works without it. Only
     overlay mode is lost - and without this check that loss is silent,
@@ -210,6 +226,22 @@ def check_overlay_host() -> Requirement:
     looks exactly like the button doing nothing.
     """
     ok, detail = False, "not installed - overlay mode unavailable"
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    if sys.platform != "win32":
+        # Linux: the overlay host is the layer-shell binary that will sit
+        # in overlay/ (Phase 2 of the port - it needs the compositor's
+        # layer-shell protocol, which an xdg_toplevel window cannot reach).
+        # Until it is built, overlay mode is unavailable and this reports
+        # it, so the setup window and the log agree.
+        exe = os.path.join(here, "overlay", "great_sage_overlay")
+        ok = os.path.exists(exe)
+        detail = ("found" if ok
+                  else "not built yet - overlay mode unavailable (Phase 2)")
+        return Requirement(
+            key="overlay_host", label="Overlay host", ok=ok, detail=detail,
+            blocking=False,
+            fix_hint="Only needed for the transparent desktop overlay.")
 
     if getattr(sys, "frozen", False):
         # In a build there is no PySide6 to import HERE - it lives in the
@@ -231,7 +263,6 @@ def check_overlay_host() -> Requirement:
     # process has a different, newer PySide6, and reporting its version
     # would name a Qt the overlay never uses: 6.10.1 here, 6.4.3 in the
     # venv that actually runs, and only 6.4.x is free of the flicker.
-    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     venv_py = os.path.join(here, ".overlay-venv", "Scripts", "python.exe")
     if os.path.exists(venv_py):
         rc, out = _run([venv_py, "-c",
@@ -284,9 +315,9 @@ def check_reference_voice() -> Requirement:
     )
 
 
-ALL_CHECKS = (check_ollama_installed, check_ollama_running, check_model,
-              check_webview2, check_gpu, check_voice_weights,
-              check_overlay_host, check_reference_voice)
+ALL_CHECKS = (check_llama_server, check_model, check_webview,
+              check_gpu, check_voice_weights, check_overlay_host,
+              check_reference_voice)
 
 
 def run_all() -> List[Requirement]:

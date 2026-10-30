@@ -1,11 +1,16 @@
 # Installing Great Sage
 
-Windows only. Roughly 30 minutes, most of it downloads.
+Linux, under a Wayland compositor. Roughly 30 minutes, most of it
+downloads. Developed and tested on CachyOS + Niri; the compositor-dependent
+parts (overlay, hotkey, window awareness) use the standard wlr-/xdg-
+protocols, so wlroots-family compositors should work as-is.
 
-Three things live outside the app and cannot be bundled: **Ollama**, the
-**chat model** it serves, and Microsoft's **WebView2** runtime. The voice
-weights are a fourth - they download themselves the first time Great Sage
-speaks. That is what most of the size and most of the waiting is.
+Three things live outside the app and cannot be bundled: **the model
+server** (llama.cpp's `llama-server`, or a router such as llama-swap in
+front of it), **the chat model** it loads, and the **WebKitGTK** system
+library the HUD window renders through. The voice weights are a fourth -
+they download themselves the first time Great Sage speaks. That is what
+most of the size and most of the waiting is.
 
 ---
 
@@ -13,47 +18,67 @@ speaks. That is what most of the size and most of the waiting is.
 
 | | Why |
 |---|---|
-| **Windows 10 or 11** | The overlay, the global hotkey and the window handling are Win32 |
-| **An NVIDIA GPU** | Not strictly required, but the voice is unusably slow without one. Developed on a 3060 (12GB) |
+| **A Wayland compositor** | Niri, Sway, Hyprland, KDE - anything implementing the standard protocols |
+| **An NVIDIA GPU** | Not strictly required, but the voice is unusably slow without one. Developed on a 3060 (12GB) and a 5060 Ti (16GB) |
 | **~10 GB free** | App, chat model, and voice weights |
-| **Python 3.14** | The app itself |
-| **Python 3.11** | A second install, for the overlay window only |
-
-**Both Python versions, really.** The transparent overlay needs PySide6
-6.4.3, which has no build for 3.14, and newer Qt flickers on a
-translucent always-on-top window. So the overlay runs as its own process
-on 3.11. Get both from [python.org](https://www.python.org/downloads/windows/)
-and tick **"Add python.exe to PATH"** on the first one.
+| **Python 3.12-3.14** | The app itself, in a venv |
+| **WebKitGTK** | `libwebkit2gtk-4.1` + `gir1.2-webkit2-4.1` (or the webkitgtk-6.0 equivalents) |
 
 ---
 
-## Step 1 - Ollama and the model
+## Step 1 - The model server and the model
 
-Install [Ollama](https://ollama.com/download), then in a terminal:
+Get [llama.cpp](https://github.com/ggml-org/llama.cpp/releases) (or build
+it), a GGUF model, and run a server:
 
 ```bash
-ollama pull qwen3.5:4b
+llama-server -m /path/to/model.gguf --jinja -ngl 99 -c 32768
 ```
 
-About 2.5 GB. Ollama runs as a background service after install; you do
-not need to start it by hand.
+It listens on `http://localhost:8080` by default - where the app looks.
+`--jinja` is what makes tool calling and the thinking switch work.
 
 Check it worked:
 
 ```bash
-ollama list
+curl http://localhost:8080/v1/models
 ```
 
-`qwen3.5:4b` should be in the output.
+Your model's name should be in the JSON.
+
+**Using a router such as llama-swap?** Point the app at it in
+`great_sage/config/settings_local.py` (git-ignored):
+
+```python
+LLM_BASE_URL = "http://localhost:27906"
+LLM_API_KEY = "..."                      # the apiKeys in its config
+LLM_DEFAULT_MODEL = "one of its model names"
+```
+
+Leave the file out and the app runs against a bare `llama-server` on
+port 8080 with the first model it reports.
 
 ---
 
-## Step 2 - WebView2
+## Step 2 - WebKitGTK
 
-Most Windows 11 machines already have it. If the setup window says it is
-missing, get the **Evergreen Bootstrapper** from
-[Microsoft](https://developer.microsoft.com/microsoft-edge/webview2/),
-run it, and carry on.
+The HUD window renders through the system WebKit, and the voice plays
+through its GStreamer pipeline - both are system packages:
+
+```bash
+# Arch / CachyOS:
+sudo pacman -S webkit2gtk-4.1 gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-pipewire
+# Debian / Ubuntu:
+sudo apt install libwebkit2gtk-4.1-0 gir1.2-webkit2-4.1 gstreamer1.0-plugins-base \
+    gstreamer1.0-plugins-good gstreamer1.0-plugins-ugly gstreamer1.0-libav
+```
+
+Without the GStreamer plugins the window renders fine but is silent, and
+the log shows `Timed out waiting for the HUD to finish playing audio`.
+Audio follows the system's default output device (PipeWire/PulseAudio).
+
+The app's startup check reports exactly what it found.
 
 ---
 
@@ -66,25 +91,27 @@ cd The-GREAT-SAGE
 
 ---
 
-## Step 4 - PyTorch, before anything else
+## Step 4 - The venv and PyTorch, before anything else
 
-**This order matters.** Install torch on its own first, with the CUDA
-build for your GPU. If you let `requirements.txt` resolve it, pip gives
-you the CPU build and the voice is too slow to use.
+**The torch order matters.** Install torch on its own first, with the
+CUDA build for your GPU. If you let `requirements.txt` resolve it, pip
+gives you the CPU build and the voice is too slow to use.
 
 ```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu121
+python3 -m venv .venv
+.venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cu128
 ```
 
+`cu128` covers every NVIDIA card up to and including Blackwell (RTX 50).
 Check which CUDA version your driver supports with `nvidia-smi` (top
-right of the output) and adjust `cu121` if you need a different one -
+right of the output) and adjust the index if you need a different one -
 [pytorch.org/get-started/locally](https://pytorch.org/get-started/locally)
 gives the exact command.
 
 Then verify, before going further:
 
 ```bash
-py -c "import torch; print(torch.cuda.is_available())"
+.venv/bin/python -c "import torch; print(torch.cuda.is_available())"
 ```
 
 **This must print `True`.** If it prints `False`, stop and fix it here -
@@ -96,31 +123,20 @@ troubleshooting below.
 ## Step 5 - Everything else
 
 ```bash
-pip install -r requirements.txt
+.venv/bin/pip install -r requirements.txt
 ```
 
 ---
 
-## Step 6 - The overlay's own environment
+## Step 6 - Run it
 
 ```bash
-py -3.11 -m venv .overlay-venv
-.overlay-venv\Scripts\pip install PySide6==6.4.3
+.venv/bin/python app.py
 ```
 
-The main app runs fine without this - you just cannot enter overlay mode.
-
----
-
-## Step 7 - Run it
-
-```bash
-py app.py
-```
-
-On a machine that is not set up, this opens the **setup window** instead
-of the HUD, listing what is missing and installing what it can. Once
-everything is green it goes straight to the HUD from then on.
+If something is missing, the startup check says what and how to fix it
+(`.venv/bin/python -m great_sage.preflight` runs the same checks from a
+terminal).
 
 **The first reply will be slow.** Great Sage downloads the F5-TTS voice
 model and the Vocos vocoder the first time it speaks - about 3.6 GB. It
@@ -132,10 +148,22 @@ is not frozen. After that it is local and fast.
 
 | | |
 |---|---|
-| **Hold Alt+1** | talk; release to send. Works from any window, including inside a game |
+| **Hold Ctrl+Alt+S** | Windows: hold to talk - the key going down opens the microphone, the key going up sends. Change it in settings |
+| **Alt+F5** (niri) | Linux: the global voice key, works from any window - press once to listen, press again to send. It is a niri `binds` entry, not an app key - see below |
 | **Click the core** | the radial menu: settings, chat, logs, overlay |
 | **F1** | show/hide the developer chrome |
 | **Esc** | close whatever is open |
+
+### Global voice key on Linux (niri)
+
+The settings "voice key" button re-registers the key with `RegisterHotKey` - a Windows API that cannot claim any key on Wayland. So on Linux every rebind is reported as "already in use" while nothing is actually registered. On Linux the key lives in the compositor's config instead:
+
+```kdl
+# ~/.config/niri/dms/binds.kdl
+Alt+F5 hotkey-overlay-title="Great Sage: voice" { spawn "/path/to/Great-Sage/gs_hotkey.py" "ptt_toggle"; }
+```
+
+niri binds fire on the key PRESS - the key-up never reaches the app - so the key is a toggle: press once to start listening, press again to stop and transcribe. The reply lands in the main HUD, the same route the wake word uses. Add as many more combos as you want: just add more `binds` entries spawning `gs_hotkey.py` (niri accepts three-button combos like `Ctrl+Alt+Shift+X` too, so the two-button space is not exhausted). `gs_hotkey.py` also takes `ptt_start` / `ptt_stop` if you prefer two separate keys.
 
 ---
 
@@ -148,14 +176,14 @@ Almost always one of three things, in this order of likelihood.
 **1. torch is the CPU build.**
 
 ```bash
-py -c "import torch; print(torch.cuda.is_available())"
+.venv/bin/python -c "import torch; print(torch.cuda.is_available())"
 ```
 
 If this prints `False`, that is the problem. Reinstall:
 
 ```bash
-pip uninstall torch
-pip install torch --index-url https://download.pytorch.org/whl/cu121
+.venv/bin/pip uninstall torch
+.venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cu128
 ```
 
 **2. The voice weights could not download.**
@@ -178,42 +206,48 @@ cloned voice.
 failed on startup. Search it for `Voice` and the reason will be there in
 plain English.
 
-## The setup window is stuck / nothing happens when I click Install
+## The window never appears at all
 
-The buttons that install things run `winget` underneath and need it
-present. If a row will not go green, install that one by hand from the
-link the window shows, then press **Re-check**. Nothing is lost -
-detection is shared with the app's own startup check, so once it is
-actually installed the window will see it.
+If nothing opens, the most likely cause is a missing WebKitGTK (step 2)
+- it is the thing that draws the window. Install the system packages,
+re-run, and the startup check will confirm what it found.
 
-If the setup window itself will not open, WebView2 is missing - it is the
-thing that draws it. Install the Evergreen Bootstrapper (step 2) and try
-again.
+## The window appears but is silent
 
-## "No connection to Ollama" / replies never arrive
+The voice engine is working (the log shows audio being generated) but
+nothing comes out of the speakers, and `great_sage.log` ends with
+`Timed out waiting for the HUD to finish playing audio`. That is the
+missing GStreamer plugins from step 2 - WebKitGTK plays the in-window
+audio through them. Install the packages, restart, and it speaks.
+
+## "Could not reach the llama.cpp server" / replies never arrive
 
 ```bash
-ollama list
+curl http://localhost:8080/v1/models
 ```
 
-- **Command not found** - Ollama is not installed, or not on PATH. Reinstall.
-- **Empty list** - run `ollama pull qwen3.5:4b`.
-- **Lists the model but Great Sage still cannot reach it** - the service is
-  not running. Start it with `ollama serve`, or reboot.
+- **Connection refused** - the server is not running. Start
+  `llama-server -m <model.gguf> --jinja`, or your router.
+- **401 unauthorized** - a router (llama-swap) is up but the key is wrong:
+  check `LLM_API_KEY` in `great_sage/config/settings_local.py` against
+  the `apiKeys` in its config.
+- **200 but your model is not in the list** - set `LLM_DEFAULT_MODEL` in
+  `settings_local.py` to one of the names the list contains.
 
 ## Push-to-talk does nothing
 
-Another application has claimed **Alt+1**. Open settings and pick a
-different key - the panel says whether the one you chose was actually
-registered. Great Sage keeps retrying every few seconds, so if the other
-app releases the key it will pick it up on its own.
+The global hotkey is registered through the compositor, not by the app
+grabbing a key. On niri it is a `binds` entry (see `core/global_hotkey.py`
+for the exact config line) - if another bind claims the same keys, the
+compositor decides, not the app. Pick a different key in the settings.
 
 Also check the **Microphone** setting is the right device.
 
 ## Overlay mode does nothing
 
-`.overlay-venv` is missing or has the wrong PySide6. Redo step 6. The
-version matters - `PySide6==6.4.3` exactly, not the latest.
+The transparent overlay is the last piece of the Linux port (it needs the
+compositor's layer-shell protocol). Until it lands, the main window works
+fully and overlay mode is unavailable.
 
 ## It answers but will not open or search anything
 
@@ -226,6 +260,6 @@ routing bug and there is a test file for exactly this
 
 ## Where your data lives
 
-Conversations, memories, settings and API keys are written **next to the
-exe**, or in the project folder when run from source. Nothing is sent
-anywhere. Deleting that folder resets Great Sage to a fresh install.
+Conversations, memories, settings and API keys are written **in the
+project folder** (or next to the binary in a packaged build). Nothing is
+sent anywhere. Deleting those files resets Great Sage to a fresh install.

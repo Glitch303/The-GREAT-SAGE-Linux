@@ -82,11 +82,34 @@ def _get_system_status() -> str:
 def _list_running_apps() -> str:
     """Visible windows, not every process: "what is running" means what
     the user can see, not 200 background services."""
+    if os.name != "nt":
+        # X11's window list, via wmctrl. On a Wayland session this sees
+        # XWayland clients only - Wayland-native windows have no generic
+        # enumeration API - which is why the result says where it came
+        # from rather than pretending to be complete.
+        try:
+            import subprocess
+            out = subprocess.run(["wmctrl", "-l"], capture_output=True,
+                                 text=True, timeout=5)
+            names: List[str] = []
+            for line in out.stdout.splitlines():
+                # "<id> <desktop> <host> <title>"
+                parts = line.split(None, 3)
+                if len(parts) == 4:
+                    title = parts[3].strip()
+                    if title and title not in names:
+                        names.append(title)
+            if not names:
+                return ("Nothing with a window (X11 list; Wayland-native "
+                        "windows are not visible to it).")
+            return ", ".join(names[:25])
+        except Exception as exc:
+            raise ToolError("Could not list windows: %s" % exc)
     try:
         import ctypes
         import ctypes.wintypes as wt
         u = ctypes.windll.user32
-        names: List[str] = []
+        names = []
         buf = ctypes.create_unicode_buffer(512)
 
         def cb(h, _l):
@@ -106,30 +129,62 @@ def _list_running_apps() -> str:
 _APP_CACHE: Dict[str, str] = {}
 
 
-def _installed_apps() -> Dict[str, str]:
-    """Lowercased name -> shortcut path, from the Start Menu.
+def _desktop_name(path: str) -> str:
+    """The Name= of a .desktop file, or "" if it is not launchable."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith("Name="):
+                    return line[5:].strip().strip('"')
+                if line.startswith("NoDisplay=") and line.split("=", 1)[1].strip().lower() == "true":
+                    return ""
+    except OSError:
+        return ""
+    return ""
 
-    Start Menu shortcuts rather than a scan of Program Files, because they
-    are what the user thinks of as installed applications - and because a
-    fixed set is what makes open_application safe. The model supplies a
-    name to look up, never a path or a command to run.
+
+def _installed_apps() -> Dict[str, str]:
+    """Lowercased name -> launch path.
+
+    Windows: Start Menu shortcuts, not a scan of Program Files, because
+    they are what the user thinks of as installed applications - and
+    because a fixed set is what makes open_application safe. The model
+    supplies a name to look up, never a path or a command to run.
+    Linux: .desktop files from the application menus (the same set the
+    launcher shows); xdg-open launches one by path.
     """
     global _APP_CACHE
     if _APP_CACHE:
         return _APP_CACHE
-    roots = [
-        os.path.join(os.environ.get("APPDATA", ""),
-                     "Microsoft", "Windows", "Start Menu", "Programs"),
-        os.path.join(os.environ.get("PROGRAMDATA", ""),
-                     "Microsoft", "Windows", "Start Menu", "Programs"),
-    ]
     found: Dict[str, str] = {}
-    for root in roots:
-        if not root or not os.path.isdir(root):
-            continue
-        for path in glob.glob(os.path.join(root, "**", "*.lnk"), recursive=True):
-            name = os.path.splitext(os.path.basename(path))[0]
-            found.setdefault(name.lower(), path)
+    if os.name == "nt":
+        roots = [
+            os.path.join(os.environ.get("APPDATA", ""),
+                         "Microsoft", "Windows", "Start Menu", "Programs"),
+            os.path.join(os.environ.get("PROGRAMDATA", ""),
+                         "Microsoft", "Windows", "Start Menu", "Programs"),
+        ]
+        for root in roots:
+            if not root or not os.path.isdir(root):
+                continue
+            for path in glob.glob(os.path.join(root, "**", "*.lnk"), recursive=True):
+                name = os.path.splitext(os.path.basename(path))[0]
+                found.setdefault(name.lower(), path)
+    else:
+        xdg = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+        roots = [
+            os.path.join(xdg, "applications"),
+            "/usr/local/share/applications",
+            "/usr/share/applications",
+        ]
+        for root in roots:
+            if not root or not os.path.isdir(root):
+                continue
+            for path in glob.glob(os.path.join(root, "*.desktop")):
+                name = _desktop_name(path)
+                if name:
+                    found.setdefault(name.lower(), path)
     _APP_CACHE = found
     log.info("Tool layer: %d installed applications indexed", len(found))
     return found
@@ -153,6 +208,18 @@ def _resolve_app(name: str) -> Optional[str]:
     return apps[sorted(contains, key=len)[0]]
 
 
+def _launch(target: str) -> None:
+    """Open a file or an application entry: ShellExecute on Windows,
+    xdg-open on Linux (which handles both files and .desktop paths)."""
+    import subprocess
+    if os.name == "nt":
+        os.startfile(target)
+    else:
+        subprocess.Popen(
+            ["xdg-open", target],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def _open_application(name: str) -> str:
     target = _resolve_app(name)
     if not target:
@@ -160,7 +227,7 @@ def _open_application(name: str) -> str:
             "No installed application matches %r. It is not in the Start "
             "Menu, so there is nothing to launch." % name)
     try:
-        os.startfile(target)
+        _launch(target)
     except Exception as exc:
         raise ToolError("Could not launch %s: %s" % (name, exc))
     return "Launched %s." % os.path.splitext(os.path.basename(target))[0]
@@ -252,7 +319,7 @@ def _open_folder(path: str) -> str:
             raise ToolError(
                 "No folder called %r was found in your user folder." % leaf)
     try:
-        os.startfile(p if os.path.isdir(p) else os.path.dirname(p))
+        _launch(p if os.path.isdir(p) else os.path.dirname(p))
     except Exception as exc:
         raise ToolError("Could not open %s: %s" % (p, exc))
     return "Opened %s." % p
@@ -342,8 +409,9 @@ REGISTRY: List[Tool] = [
 BY_NAME: Dict[str, Tool] = {t.name: t for t in REGISTRY}
 
 
-def ollama_schema() -> List[Dict[str, Any]]:
-    """The registry in the shape Ollama's /api/chat expects."""
+def tool_schema() -> List[Dict[str, Any]]:
+    """The registry in the OpenAI function schema - the shape both
+    llama.cpp's OpenAI-compatible API and api.openai.com accept."""
     return [{"type": "function",
              "function": {"name": t.name,
                           "description": t.description,
@@ -441,6 +509,20 @@ def take_pending_images() -> List[str]:
 
 
 def _focused_window() -> str:
+    if os.name != "nt":
+        # xdotool asks X11; on a Wayland session that is XWayland clients
+        # only. Wayland has no generic active-window API, so rather than
+        # guess the answer says it does not know.
+        try:
+            import subprocess
+            out = subprocess.run(
+                ["xdotool", "getactivewindow", "getwindowname"],
+                capture_output=True, text=True, timeout=5)
+            if out.returncode == 0 and out.stdout.strip():
+                return out.stdout.strip()
+        except Exception:
+            pass
+        return "unknown (Wayland does not expose the active window)"
     try:
         import ctypes
         u = ctypes.windll.user32
@@ -454,6 +536,29 @@ def _focused_window() -> str:
         return "unknown"
 
 
+def _x11_window_rect():
+    """The active window's (x, y, w, h) via xdotool, or None."""
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["xdotool", "getactivewindow", "getwindowgeometry", "--shell"],
+            capture_output=True, text=True, timeout=5)
+        if out.returncode != 0:
+            return None
+        vals = {}
+        for line in out.stdout.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                vals[k.strip()] = v.strip()
+        x, y = int(vals.get("X", "-1")), int(vals.get("Y", "-1"))
+        w, h = int(vals.get("WIDTH", "0")), int(vals.get("HEIGHT", "0"))
+        if x >= 0 and y >= 0 and w > 0 and h > 0:
+            return (x, y, w, h)
+    except Exception:
+        pass
+    return None
+
+
 def _capture(region: str = "") -> str:
     """Screenshot the desktop (or just the focused window) for the model.
 
@@ -462,31 +567,68 @@ def _capture(region: str = "") -> str:
     long edge keeps on-screen text readable, which is the whole point of
     being asked what something says.
     """
-    try:
-        from PIL import ImageGrab
-    except Exception:
-        raise ToolError("Screen capture is unavailable: Pillow is missing.")
+    want_window = (region or "").strip().lower() in ("window", "focused", "active")
     box = None
-    if (region or "").strip().lower() in ("window", "focused", "active"):
-        try:
-            import ctypes
-            import ctypes.wintypes as wt
+    if os.name == "nt":
+        if want_window:
+            try:
+                import ctypes
 
-            class R(ctypes.Structure):
-                _fields_ = [("l", ctypes.c_long), ("t", ctypes.c_long),
-                            ("r", ctypes.c_long), ("b", ctypes.c_long)]
-            h = ctypes.windll.user32.GetForegroundWindow()
-            r = R()
-            ctypes.windll.user32.GetWindowRect(h, ctypes.byref(r))
-            if r.r > r.l and r.b > r.t:
-                box = (r.l, r.t, r.r, r.b)
-        except Exception:
-            box = None          # fall back to the whole desktop
-    try:
-        img = ImageGrab.grab(bbox=box)
-    except Exception as exc:
-        raise ToolError("Could not capture the screen: %s" % exc)
-    img = img.convert("RGB")
+                class R(ctypes.Structure):
+                    _fields_ = [("l", ctypes.c_long), ("t", ctypes.c_long),
+                                ("r", ctypes.c_long), ("b", ctypes.c_long)]
+                h = ctypes.windll.user32.GetForegroundWindow()
+                r = R()
+                ctypes.windll.user32.GetWindowRect(h, ctypes.byref(r))
+                if r.r > r.l and r.b > r.t:
+                    box = (r.l, r.t, r.r, r.b)
+            except Exception:
+                box = None          # fall back to the whole desktop
+        try:
+            from PIL import ImageGrab
+            img = ImageGrab.grab(bbox=box)
+        except Exception as exc:
+            raise ToolError("Could not capture the screen: %s" % exc)
+    else:
+        # Wayland has no generic screenshot API; grim (wlr-screencopy) is
+        # the standard tool. A window region comes from xdotool, which on
+        # a Wayland session sees XWayland clients only - if the window is
+        # not X11, fall back to the whole screen and say so.
+        import shutil as _sh
+        img = None
+        if _sh.which("grim"):
+            if want_window:
+                box = _x11_window_rect()
+            import subprocess
+            import tempfile
+            tmp = os.path.join(tempfile.gettempdir(),
+                               "great_sage_shot_%d.png" % os.getpid())
+            cmd = ["grim"]
+            if box:
+                cmd += ["-g", "%d,%d,%d,%d" % box]
+            cmd.append(tmp)
+            try:
+                subprocess.run(cmd, check=True, timeout=10)
+                from PIL import Image
+                img = Image.open(tmp).convert("RGB")
+            finally:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+        elif os.environ.get("DISPLAY"):
+            from PIL import ImageGrab
+            if want_window:
+                box = _x11_window_rect()
+            try:
+                img = ImageGrab.grab(xdisplay=os.environ["DISPLAY"],
+                                     bbox=box).convert("RGB")
+            except Exception as exc:
+                raise ToolError("Could not capture the screen: %s" % exc)
+        if img is None:
+            raise ToolError(
+                "Screen capture is unavailable: install grim (Wayland) or "
+                "run under X11.")
     img.thumbnail((1280, 1280))
     import base64
     import io as _io

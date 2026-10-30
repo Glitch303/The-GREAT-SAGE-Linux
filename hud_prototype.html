@@ -1887,7 +1887,7 @@ body.mini:hover #mini-exit { opacity: 1; }
             <div class="ai-set-group">
               <label>Chat provider</label>
               <select id="ai-chat-provider"></select>
-              <span class="ai-set-hint">Local uses Ollama and needs no key.</span>
+              <span class="ai-set-hint">Local uses llama.cpp and needs no key (a bare server).</span>
             </div>
 
             <div class="ai-set-group">
@@ -6286,8 +6286,7 @@ const MINI_CHAT_PAD = 3;
       // slider setting would throw rather than simply being loud.
       el.volume = Math.max(0, Math.min(1, sfxVolume * (SFX_GAIN[name] || 1)));
       el.currentTime = 0;
-      const p = el.play();
-      if (p && p.catch) p.catch(() => {});
+      unlockedPlay(el);
     } catch (err) { /* a missing or undecodable clip must not break the UI */ }
   }
 
@@ -6397,6 +6396,26 @@ const MINI_CHAT_PAD = 3;
     }, 30);
   }
 
+  // WebKit (measured 2026-10-30, WebKitGTK 2.54.2) gates every UNMUTED
+  // element play() on a user gesture current AT the call. A click that
+  // unlocked the AudioContext seconds earlier is not enough, so audio
+  // that arrives over the websocket - wake-word replies, PTT, fx
+  // previews - is rejected with NotAllowedError even with the context
+  // running. Muted playback is always allowed, and for elements wired
+  // into the WebAudio graph the mute applies to what flows into the
+  // graph: play muted, drop the mute the instant playback starts. The
+  // first tens of milliseconds come up muted; F5 clips lead with a
+  // breath of silence, so the word itself is intact. (Chromium/WebView2
+  // runs with --autoplay-policy=no-user-gesture-required, where the
+  // muted hop is simply never needed.)
+  function unlockedPlay(el) {
+    const wasMuted = el.muted;
+    el.muted = true;
+    return el.play()
+      .then(() => { el.muted = wasMuted; })
+      .catch((err) => { el.muted = wasMuted; throw err; });
+  }
+
   const analyser = audioCtx.createAnalyser();
   analyser.fftSize = 256;
   analyser.smoothingTimeConstant = 0.6;
@@ -6420,15 +6439,91 @@ const MINI_CHAT_PAD = 3;
   wireAnalyser(voiceLineAudio);
   wireAnalyser(voiceLineAudioB);
 
+  // WebKitGTK quirk (measured 2026-10-30): the FIRST preroll of a clip
+  // after the AudioContext resumes can leave the element PAUSED at the
+  // preroll seek (~1.11s in) - no audio, no 'ended', and the server sits
+  // out its ack timeout - while the very next clip (second preroll)
+  // plays fine. The GStreamer pipeline's first preroll after a resume is
+  // the one that fails, so consume it HERE at gesture time on a silent
+  // clip: every real clip then starts as a second-or-later preroll. The
+  // silence length matches the server's preroll prebuf (see
+  // browser_sink.py) - the preroll eats silence either way.
+  function makeSilenceWavUrl(seconds) {
+    const rate = 24000, n = Math.floor(seconds * rate);
+    const buf = new ArrayBuffer(44 + n * 2);
+    const v = new DataView(buf);
+    const tag = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+    tag(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); tag(8, 'WAVE');
+    tag(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+    v.setUint16(22, 1, true); v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true);
+    v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+    tag(36, 'data'); v.setUint32(40, n * 2, true);
+    return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+  }
+  const primeAudio = new Audio();
+  primeAudio.src = makeSilenceWavUrl(1.3);
+  wireAnalyser(primeAudio);
+  let webAudioPrimed = false;
+  function primeWebAudioPipeline() {
+    if (webAudioPrimed || audioCtx.state !== 'running') return;
+    webAudioPrimed = true;
+    dbgAudio('PRIME: playing silent preroll clip');
+    try { unlockedPlay(primeAudio).catch(() => { }); } catch (err) { }
+  }
+
   // Both elements above now reach the speakers only through audioCtx, so
   // the context being suspended silences everything. Chromium unsuspends
   // one only on a user gesture, so grab the first one of any kind - a
   // push-to-talk keypress counts, which is what makes voice-initiated
   // replies audible without the user having to click anything first.
+  // (A COMPOSITOR-level keybind, e.g. the Linux niri bind that sends
+  // Alt+F5, is consumed before it reaches the page and does NOT count -
+  // on such setups the first in-window click is the unlock.)
   ['pointerdown', 'keydown'].forEach((evt) => {
     window.addEventListener(evt, () => {
-      if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+      if (audioCtx.state === 'suspended') {
+        const t0 = performance.now();
+        audioCtx.resume()
+          .then(() => { dbgAudio('gesture ' + evt + ': resume resolved in ' + Math.round(performance.now() - t0) + 'ms, state=' + audioCtx.state); primeWebAudioPipeline(); })
+          .catch((e) => dbgAudio('gesture ' + evt + ': resume REJECTED ' + (e && e.name)));
+      }
+      primeWebAudioPipeline();
     }, { capture: true });
+  });
+
+  // TEMP AUDIO-DBG (remove after diagnosis): page -> server log
+  function dbgAudio(msg) {
+    if (typeof ws !== 'undefined' && ws && ws.readyState === WebSocket.OPEN)
+      ws.send(JSON.stringify({ type: 'page_error', what: 'AUDIO-DBG',
+        detail: String(msg).slice(0, 400) }));
+  }
+
+  // While the context is locked, replies are skipped (see
+  // playServerAudio) and the user would otherwise get silence with no
+  // visible reason. Say so the moment a clip is about to be skipped,
+  // and drop the note as soon as a gesture unlocks the context.
+  let audioLockNote = null;
+  function noteAudioLocked() {
+    if (audioCtx.state !== 'suspended') { removeAudioLockNote(); return; }
+    if (!audioLockNote) {
+      audioLockNote = document.createElement('div');
+      audioLockNote.textContent = 'Voice is muted - click this window to enable it';
+      Object.assign(audioLockNote.style, {
+        position: 'fixed', top: '12px', left: '50%', transform: 'translateX(-50%)',
+        padding: '6px 14px', borderRadius: '6px', fontSize: '13px',
+        fontFamily: 'Consolas, monospace', color: '#e8f2ff',
+        background: 'rgba(3,11,8,0.88)', border: '1px solid rgba(120,200,160,0.4)',
+        zIndex: '1000', pointerEvents: 'none', whiteSpace: 'nowrap',
+      });
+      document.body.appendChild(audioLockNote);
+    }
+  }
+  function removeAudioLockNote() {
+    if (audioLockNote) { audioLockNote.remove(); audioLockNote = null; }
+  }
+  audioCtx.addEventListener('statechange', () => {
+    dbgAudio('statechange -> ' + audioCtx.state);
+    if (audioCtx.state === 'running') removeAudioLockNote();
   });
 
   let currentlyPlayingEl = null;
@@ -6576,13 +6671,21 @@ const MINI_CHAT_PAD = 3;
     voiceLineAudio.src = url;
     voiceLineAudio.currentTime = 0;
 
+    // TEMP AUDIO-DBG (remove after diagnosis)
+    const dbgT0 = performance.now();
+    const dbgTag = (el === speechAudios[0]) ? 'A' : 'B';
+    const dbg = (m) => dbgAudio('[clip ' + dbgTag + '] ' + m + ' (t+' + Math.round(performance.now() - dbgT0) + 'ms)');
+    dbg('send: ctx=' + audioCtx.state + ' bytes=' + base64Data.length + ' dur=' + voiceLineAudio.duration);
+
     // Exactly one ack per clip. Python clears its wait flag before each
     // send, so a duplicate arriving late would unblock the NEXT clip
     // early and cut it off - hence the latch rather than a bare send.
     let acked = false;
+    let dbgDeadline = null;   // TEMP AUDIO-DBG
     const ack = () => {
       if (acked) return;
       acked = true;
+      clearTimeout(dbgDeadline);
       // The url is NOT revoked here. Each element releases its own
       // previous url on its next use instead, which stays correct whether
       // or not the ack leads the end of the clip - revoking here would be
@@ -6591,7 +6694,7 @@ const MINI_CHAT_PAD = 3;
         ws.send(JSON.stringify({ type: 'audio_ended' }));
       }
     };
-    voiceLineAudio.onended = ack;
+    voiceLineAudio.onended = () => { dbg('ENDED -> ack'); ack(); };
     // Release Python a fraction before the end, so the following chunk
     // can be generated, sent, and started while this one is still
     // ringing out. The 'ended' handler above stays as the backstop for
@@ -6614,27 +6717,97 @@ const MINI_CHAT_PAD = 3;
     // the Python side blocked for its full 30s ack timeout and then
     // raising - the reply is lost and every later one is delayed.
     voiceLineAudio.onerror = () => {
+      dbg('ERROR code=' + (voiceLineAudio.error && voiceLineAudio.error.code) + ' -> ack');
       console.warn('Reply audio failed to play', voiceLineAudio.error);
       ack();
     };
+    // TEMP AUDIO-DBG (remove after diagnosis)
+    let dbgTu = 0;
+    ['play', 'pause', 'waiting', 'stalled', 'canplay', 'playing', 'seeking', 'durationchange'].forEach((ev) => {
+      voiceLineAudio.addEventListener(ev, () => dbg('el.' + ev + ' ct=' + voiceLineAudio.currentTime.toFixed(2) + ' dur=' + voiceLineAudio.duration));
+    });
+    voiceLineAudio.addEventListener('timeupdate', () => { if (dbgTu++ < 8) dbg('timeupdate ct=' + voiceLineAudio.currentTime.toFixed(2) + ' dur=' + voiceLineAudio.duration); });
+
+    // WebKitGTK can PAUSE the clip at the preroll seek - measured: 'playing'
+    // at t+42ms with ct=1.11, then 'pause' at t+44ms, same ct - instead of
+    // playing it, killing the first clip after a context resume. Nothing in
+    // this page pauses a clip that early, so treat it as the quirk and
+    // restart ONCE: reassigning src re-runs the preroll, and a pipeline that
+    // has already had one preroll attempt plays (measured - the second clip
+    // after the same failure plays fine). The ack deadline above is
+    // re-armed by the reload's durationchange, so a second failure still
+    // acks at deadline instead of hanging the server.
+    let dbgRetried = false;
+    let dbgStartCt = null;
+    voiceLineAudio.addEventListener('playing', () => { dbgStartCt = voiceLineAudio.currentTime; });
+    voiceLineAudio.addEventListener('pause', () => {
+      if (dbgRetried || dbgStartCt === null) return;
+      if (performance.now() - dbgT0 > 800) return;
+      if (Math.abs(voiceLineAudio.currentTime - dbgStartCt) >= 0.25) return;
+      dbgRetried = true;
+      dbg('EARLY PAUSE at preroll -> re-preroll + play');
+      voiceLineAudio.src = el.dataset.blobUrl;
+      unlockedPlay(voiceLineAudio).catch(() => { });
+    });
 
     // THE important line. voiceLineAudio is routed through
     // createMediaElementSource into audioCtx (for the amplitude-reactive
     // pulse), so its sound reaches the speakers ONLY via that graph. A
     // suspended AudioContext therefore means silence AND no 'ended'
     // event - the element never progresses - which looked exactly like
-    // "the AI stopped talking". Chromium starts every AudioContext
-    // suspended until a user gesture, and while typing a message routed
-    // through sendChatMessage() (which resumes it), push-to-talk and the
-    // wake word did not. Resuming here covers every path that can
-    // produce audio, since they all funnel through this function.
-    Promise.resolve(audioCtx.state === 'suspended' ? audioCtx.resume() : null)
-      .catch(() => {})  // resume() rejects if no gesture has happened yet
-      .then(() => voiceLineAudio.play())
-      .catch((err) => {
-        console.warn('Reply audio playback rejected', err);
+    // "the AI stopped talking". Both engines start the context
+    // suspended until a trusted in-window gesture (a click, a keypress
+    // in the page), and the two then diverge on exactly how the clip
+    // dies:
+    // - Chromium REJECTS resume() without a gesture, so the old
+    //   resume().then(play) chain fell through to play(), which also
+    //   rejected and reached the ack below.
+    // - WebKitGTK keeps resume() PENDING until a gesture arrives, and
+    //   play() on an element wired into the suspended context is
+    //   PENDING too - it neither rejects nor fires 'ended' (measured:
+    //   every clip sat out the server's full ack timeout, "Timed out
+    //   waiting for the HUD to finish playing audio").
+    //
+    // A clip routed through a suspended context can never play, so when
+    // the context is still locked there is nothing to wait for: ack
+    // now (the server moves on instead of stalling 30s per clip, and
+    // no VoiceError is raised), and tell the user the one thing that
+    // unlocks it. The first real gesture (a click or keypress in this
+    // window) resumes the context for everything after.
+    if (audioCtx.state === 'suspended') {
+      audioCtx.resume().catch(() => {});
+      noteAudioLocked();
+      dbg('FAST PATH: suspended -> immediate ack');
+      ack();
+      return;
+    }
+    const dbgPlayP = unlockedPlay(voiceLineAudio);
+    dbgPlayP.then(() => dbg('play() RESOLVED')).catch((err) => {
+      dbg('play() REJECTED: ' + (err && err.name || err));
+    });
+    // WebKitGTK can leave a clip stuck even with a RUNNING context:
+    // 'ended' never fires and play() never settles (measured once -
+    // the server then sat out its full 30s ack timeout). Bound the
+    // wait from here instead: once the expected playback time (the
+    // element duration, which on Linux includes the 1.3s preroll
+    // prebuf) plus a 4s margin has passed without 'ended', pause the
+    // element and ack so the server moves on.
+    const armAckDeadline = () => {
+      clearTimeout(dbgDeadline);
+      const dur = voiceLineAudio.duration;
+      const ms = (isFinite(dur) && dur > 0) ? dur * 1000 + 4000 : 30000;
+      dbgDeadline = setTimeout(() => {
+        dbg('DEADLINE: no ended (ct=' + voiceLineAudio.currentTime.toFixed(2) + ' dur=' + voiceLineAudio.duration + ') -> pause+ack');
+        try { voiceLineAudio.pause(); } catch (err) { }
         ack();
-      });
+      }, ms);
+    };
+    armAckDeadline();
+    voiceLineAudio.addEventListener('durationchange', armAckDeadline);
+    dbgPlayP.catch((err) => {
+      console.warn('Reply audio playback rejected', err);
+      ack();
+    });
   }
 
   function handleServerMessage(event) {
@@ -6857,7 +7030,7 @@ const MINI_CHAT_PAD = 3;
       previewAudio.pause();          // never assign src over playing audio
       previewAudio.src = 'data:' + msg.mime + ';base64,' + msg.data;
       previewAudio.currentTime = 0;
-      previewAudio.play().catch(() => {});
+      unlockedPlay(previewAudio);
     }
   }
 
@@ -9453,7 +9626,7 @@ const MINI_CHAT_PAD = 3;
           e.preventDefault(); // don't toggle the checkbox via label click-through
           previewAudio.src = 'voice_lines/' + line.file;
           previewAudio.currentTime = 0;
-          previewAudio.play().catch(() => {});
+          unlockedPlay(previewAudio);
         });
         label.appendChild(previewBtn);
       }
@@ -9533,7 +9706,7 @@ const MINI_CHAT_PAD = 3;
       previewAudio.pause();          // never assign src over playing audio
       previewAudio.src = src;
       previewAudio.currentTime = 0;
-      previewAudio.play().catch(() => {});
+      unlockedPlay(previewAudio);
     }
     // Re-audition whenever a slider moves, so dragging reverb up is
     // immediately audible instead of needing a manual replay each time.
@@ -9821,6 +9994,7 @@ const MINI_CHAT_PAD = 3;
         else el.value = saved[el.id];
       }
     });
+    settingsLoading = true;
     settingsSection.querySelectorAll('input').forEach((el) => {
       if (isVoiceListInput(el)) return;
       el.dispatchEvent(new Event(el.type === 'checkbox' || el.type === 'radio' ? 'change' : 'input'));
@@ -9831,11 +10005,24 @@ const MINI_CHAT_PAD = 3;
     }
     // Last word, over the generic scan above: whatever the flat values
     // happened to be, the controls end up holding the active theme's.
+    // applyThemeValues dispatches its own input/change events too, so
+    // the auto-save guard has to stay up across it.
     if (pendingThemeValues) applyThemeValues(pendingThemeValues);
     applyCaptionPosition(saved['caption-pos']);
+    settingsLoading = false;
   }
+  // While saved settings are replayed into the controls (below), the
+  // synthetic input/change events they fire would trip the auto-save
+  // and re-send to the server the values it just handed over - a
+  // save_settings log line a second after every HUD load, with no user
+  // involved. The guard lives in scheduleSaveSettings itself rather
+  // than at the section's listeners, because several controls (the SFX
+  // gain slider, the theme switcher) have their OWN input/change
+  // listeners that call it directly.
+  let settingsLoading = false;
   let saveSettingsTimer = null;
   function scheduleSaveSettings() {
+    if (settingsLoading) return;
     clearTimeout(saveSettingsTimer);
     saveSettingsTimer = setTimeout(() => {
       if (ws && ws.readyState === WebSocket.OPEN) {

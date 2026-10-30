@@ -4,6 +4,7 @@ it's given. Contains no provider-specific code, so it works unmodified
 no matter which AI backend is plugged in.
 """
 
+import json
 import time
 from typing import Callable, Iterator, List, Optional
 
@@ -86,28 +87,34 @@ class ChatEngine:
                 "content": SESSION_START_MARKER + user_input,
             }
 
-        # Memory goes in immediately before the user's turn, so it reads
-        # as context for this specific question rather than as part of the
-        # standing persona. Deliberately not appended to self.history:
-        # keeping it out means the visible transcript stays clean and the
-        # facts are re-selected fresh every turn instead of accumulating.
+        # Per-turn context - memory recall, and a line about how to PITCH
+        # this reply from core/state.py - is MERGED INTO THE LEADING
+        # system message, not sent as its own system messages. Chat
+        # templates on OpenAI-compatible servers require any system
+        # message to be the FIRST one: Qwen via llama.cpp --jinja raises
+        # "System message must be at the beginning" on the mid-conversation
+        # shape (HTTP 500 on every request once recall or the hint was
+        # non-empty). Ollama is the only backend that tolerated the old
+        # shape. Merging keeps what matters about the old design: it is
+        # re-selected fresh every turn, reads as context for this
+        # question rather than the standing persona, and is deliberately
+        # NOT appended to self.history, so the visible transcript stays
+        # clean and the facts do not accumulate.
+        extras = []
         if self._recall is not None:
             try:
                 block = self._recall(user_input)
             except Exception:
                 block = ""   # memory is a nice-to-have, never a blocker
             if block:
-                outgoing.insert(len(outgoing) - 1,
-                                {"role": "system", "content": block})
-
-        # A line about how to PITCH this reply, from core/state.py. Set on
-        # the engine per turn rather than baked into the persona, because
-        # it is about the last few minutes and must not accumulate. Not
-        # written to history for the same reason.
+                extras.append(block)
         hint = getattr(self, "state_hint", "")
         if hint:
-            outgoing.insert(len(outgoing) - 1,
-                            {"role": "system", "content": hint})
+            extras.append(hint)
+        if extras:
+            head = dict(outgoing[0])
+            head["content"] = (head.get("content") or "") + "\n\n" + "\n\n".join(extras)
+            outgoing[0] = head
 
         # Attached images ride on the user's own turn, which is the
         # shape Ollama expects. They are deliberately NOT written to
@@ -207,18 +214,21 @@ class ChatEngine:
             outgoing.append({"role": "assistant", "content": "",
                              "tool_calls": [{"type": "function",
                                              "function": {"name": name,
-                                                          "arguments": {}}}]})
+                                                          "arguments": "{}"}}]})
             outgoing.append({"role": "tool", "content": str(result),
                              "tool_name": name})
         if preroute_results:
             # And said plainly as well. The pair above is the correct
             # format; this is the belt to its braces, because a wrong
-            # answer here is a confidently wrong one.
-            outgoing.append({"role": "system", "content":
-                             "The tool results above were just run and are "
-                             "current. Use their values exactly as given. "
-                             "Do not adjust, reinterpret or replace them "
-                             "with anything you remember."})
+            # answer here is a confidently wrong one. Merged into the
+            # leading system message for the same template reason as the
+            # per-turn context in _build_outgoing.
+            outgoing[0] = dict(outgoing[0])
+            outgoing[0]["content"] = (outgoing[0].get("content") or "") + "\n\n" + (
+                "The tool results in this request were just run and are "
+                "current. Use their values exactly as given. "
+                "Do not adjust, reinterpret or replace them "
+                "with anything you remember.")
         if preroute_images:
             outgoing.append({"role": "user", "content": "(the screen)",
                              "images": list(preroute_images)})
@@ -232,7 +242,21 @@ class ChatEngine:
                     return reply, used
                 # Record the assistant turn that requested the calls, or
                 # the follow-up loses the thread of what it asked for.
-                outgoing.append(message)
+                # Echoed in the canonical OpenAI shape: llama.cpp (--jinja)
+                # rejects the follow-up with HTTP 500 "Missing tool call
+                # type" unless every tool call carries "type": "function"
+                # and arguments as a JSON string (measured 2026-10-30,
+                # web_search loop). Ollama ignores both fields' strictness.
+                echo = dict(message)
+                echo["tool_calls"] = [{
+                    "id": c.get("id"),
+                    "type": "function",
+                    "function": {
+                        "name": (c.get("function") or {}).get("name"),
+                        "arguments": json.dumps(
+                            (c.get("function") or {}).get("arguments") or {}),
+                    }} for c in calls]
+                outgoing.append(echo)
                 for call in calls:
                     fn = call.get("function") or {}
                     name = fn.get("name") or "?"

@@ -1,8 +1,8 @@
 # Great Sage
 
-A local-first Windows desktop AI companion, built around a 3D HUD rather
-than a chat window. Everything runs on your machine: the model, the
-speech recognition, and the voice.
+A local-first Linux desktop AI companion (Wayland), built around a 3D HUD
+rather than a chat window. Everything runs on your machine: the model,
+the speech recognition, and the voice.
 
 - **Talk to it.** Hold one key from anywhere - including inside a game -
   say what you want, let go. Transcribed locally with faster-whisper.
@@ -24,16 +24,14 @@ addresses you as Master.
 
 | | |
 |---|---|
-| Windows | 10 or 11 |
-| [Ollama](https://ollama.com/download) | running locally, with `ollama pull qwen3.5:4b` |
-| Python 3.14 | the app itself |
-| Python 3.11 | a second venv, for the overlay window only |
-| NVIDIA GPU | not required, but F5-TTS is too slow to speak in real time on CPU. Developed on a 3060 (12GB) |
+| Linux | any recent distro, under a Wayland compositor (developed on CachyOS + Niri) |
+| [llama.cpp](https://github.com/ggml-org/llama.cpp) | a running `llama-server` (or a router such as llama-swap in front of it), with a GGUF loaded |
+| Python 3.12-3.14 | the app itself, in a venv |
+| WebKitGTK | the system web engine the HUD renders through (`libwebkit2gtk-4.1` + GIR) |
+| NVIDIA GPU | not required, but F5-TTS is too slow to speak in real time on CPU. Developed on a 3060 (12GB) and a 5060 Ti (16GB) |
 
-The two Python versions are not a mistake. The transparent overlay needs
-PySide6 6.4.3, which has no build for 3.14; newer Qt flickers through
-ANGLE on a translucent always-on-top window. So the overlay is a separate
-process on 3.11 and the main app runs on 3.14. See `NOTES.md`.
+One venv is enough: the Windows build needed a second Python for the
+overlay's PySide6 pin, which was a Windows ANGLE issue. See `NOTES.md`.
 
 ## Install
 
@@ -48,21 +46,28 @@ git clone https://github.com/shogunyan12/The-GREAT-SAGE.git
 cd The-GREAT-SAGE
 
 # torch FIRST, with the CUDA build for your GPU - otherwise pip resolves
-# the CPU build and the voice is unusably slow. Check yours with nvidia-smi.
-pip install torch --index-url https://download.pytorch.org/whl/cu121
-pip install -r requirements.txt
+# the CPU build and the voice is unusably slow. cu128 covers everything
+# up to and including Blackwell (RTX 50); older cards can use their own
+# cu index. Check yours with nvidia-smi.
+python3 -m venv .venv
+.venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cu128
+.venv/bin/pip install -r requirements.txt
 
-# The overlay's own environment
-py -3.11 -m venv .overlay-venv
-.overlay-venv\Scripts\pip install PySide6==6.4.3
-
-ollama pull qwen3.5:4b
+# Then run a model server, e.g.:
+llama-server -m /path/to/model.gguf --jinja -ngl 99 -c 32768
+# it listens on http://localhost:8080 by default - where the app looks.
 ```
+
+If your server is not on port 8080 - or sits behind a router such as
+llama-swap that wants an API key - create
+`great_sage/config/settings_local.py` (git-ignored; the committed
+defaults stay the stock llama.cpp setup) with your
+`LLM_BASE_URL` / `LLM_API_KEY` / `LLM_DEFAULT_MODEL`.
 
 ## Run
 
 ```bash
-py app.py
+.venv/bin/python app.py
 ```
 
 First launch downloads the F5-TTS and faster-whisper models (a few GB,
@@ -73,7 +78,8 @@ you ask it to fetch.
 
 | | |
 |---|---|
-| **Alt+1** | hold to talk, release to send. Works from any window |
+| **Hold Ctrl+Alt+S** | Windows: hold to talk - key down opens the mic, key up sends. Change it in settings |
+| **Alt+F5** (niri) | Linux: global voice key, works from any window - press once to listen, press again to send (a niri `binds` entry spawning `gs_hotkey.py`; see INSTALL.md) |
 | **Click the core** | opens the radial menu: settings, chat, logs, overlay |
 | **F1** | shows and hides the developer chrome |
 | **Esc** | closes whatever is open |
@@ -98,6 +104,9 @@ stage that Great Sage never runs. That stage costs about six points of
 GPU on a 3060 at 1904x1041, and only while Raphael is the active theme.
 
 ## Build a standalone exe
+
+The standalone build is still the Windows two-bundle flow; Linux
+packaging (a single PyInstaller build) comes with the rest of the port.
 
 ```bash
 py build.py
@@ -143,7 +152,7 @@ check_*.py              the gates the build will not ship without
 
 great_sage/
   config/settings.py    every tunable value
-  models/               ModelProvider interface + Ollama, OpenAI, Anthropic
+  models/               ModelProvider interface + llama.cpp, OpenAI, Anthropic
   core/
     chat_engine.py      conversation, tool loop
     tools.py            the 16 tools, and the deterministic pre-routing
@@ -163,12 +172,15 @@ odd choice in there is load-bearing and the reason is written down.
 
 ## Known limitations
 
-- **Windows only.** The overlay, the global hotkey and the window
-  handling are all Win32.
-- **The model is small.** qwen3.5:4b was chosen to leave GPU headroom for
-  gaming while it runs. It is not reliable at deciding to use a tool,
-  which is why the requests that matter are pre-routed deterministically
-  rather than left to it.
+- **Wayland-specific features are compositor-dependent.** The
+  always-on-top overlay needs a compositor that implements
+  wlr-layer-shell (Niri, Sway, Hyprland do), and the global hotkey and
+  window awareness use the wlr- / xdg- protocols most wlroots-family
+  compositors provide. Developed and tested on Niri.
+- **The model is your choice now** (any GGUF via llama.cpp). The default
+  resolves to the first model the server reports. Small models are not
+  reliable at deciding to use a tool, which is why the requests that
+  matter are pre-routed deterministically rather than left to it.
 - **First launch is slow** and needs the network, for the model
   downloads.
 - **No test suite for the Python core.** The three checks above cover the

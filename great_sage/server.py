@@ -395,21 +395,22 @@ def _apply_voice_provider(voice):
 def _apply_mode(engine, cfg, send_json=None):
     """Put a mode's limits into effect (spec S39/S40).
 
-    The one that does real work is GAMING: keep_alive 0 means Ollama drops
-    the model the moment a reply finishes, which measured 4052MB of VRAM
-    handed straight back. SLEEP does the same. Everything else leaves the
-    model resident, because reloading costs about four seconds on the next
-    message and that is only worth paying when the GPU is wanted
-    elsewhere.
+    The one that does real work is GAMING: it asks for an immediate
+    unload, drops the HUD frame rate and stops listening. SLEEP does the
+    same. With llama.cpp the unload is best-effort - there is no unload
+    endpoint, so llama-swap's TTL does the evicting and a bare server
+    keeps its model resident (see LlamaCppProvider.unload()).
+    Everything else leaves the model resident, because reloading costs
+    about four seconds on the next message and that is only worth paying
+    when the GPU is wanted elsewhere.
     """
     mode = modes.get((cfg or {}).get("mode"))
     provider = getattr(engine, "provider", None)
-    if provider is not None and hasattr(provider, "keep_alive"):
-        provider.keep_alive = 0 if not mode.keep_model_loaded else None
-        if not mode.keep_model_loaded and hasattr(provider, "unload"):
-            # Do not wait for the next reply to finish - the point of the
-            # mode is to free the card NOW.
-            threading.Thread(target=provider.unload, daemon=True).start()
+    if provider is not None and not mode.keep_model_loaded \
+            and hasattr(provider, "unload"):
+        # Do not wait for the next reply to finish - the point of the
+        # mode is to free the card NOW (where the backend can).
+        threading.Thread(target=provider.unload, daemon=True).start()
     log.info("Mode: %s (model resident=%s, hud fps=%s, wake word=%s, "
              "web=%s, online=%s)", mode.label, mode.keep_model_loaded,
              mode.hud_fps or "normal", mode.wake_word, mode.allow_web,
@@ -438,16 +439,23 @@ def _apply_provider(engine, cfg):
 
 
 def _installed_models():
-    """Model names Ollama actually has, for the chat-mode selector.
+    """Model names the server actually has, for the chat-mode selector.
 
-    Asked at runtime rather than listed in settings, so pulling a new
+    Asked at runtime rather than listed in settings, so loading a new
     model makes it selectable without editing anything - spec S6 asks
-    that Qwen3.5 not be hard-coded as the permanent model.
+    that the model not be hard-coded as the permanent one. The
+    /v1/models endpoint is the same on a bare llama-server and on a
+    router such as llama-swap.
     """
     try:
         import requests
-        r = requests.get(settings.OLLAMA_HOST + "/api/tags", timeout=6)
-        names = [m.get("name", "") for m in r.json().get("models", [])]
+        headers = {}
+        if settings.LLM_API_KEY:
+            headers["Authorization"] = "Bearer " + settings.LLM_API_KEY
+        r = requests.get(
+            settings.LLM_BASE_URL.rstrip("/") + "/v1/models",
+            headers=headers, timeout=6)
+        names = [m.get("id", "") for m in r.json().get("data", [])]
         return sorted(n for n in names if n)
     except Exception:
         log.exception("Could not list installed models")
@@ -667,7 +675,7 @@ def _handle_chat(text, engine, voice, sink, websocket, loop,
         if (getattr(settings, "TOOLS_ENABLED", True)
                 and _tools_ok
                 and tool_layer.might_need_tools(text)):
-            # Tool-capable turns are NOT streamed. Ollama reports
+            # Tool-capable turns are NOT streamed. The server reports
             # tool_calls only on a complete message, so the call has to
             # finish before it is known whether one was requested at all.
             # No real loss: VOICE_SINGLE_SHOT means speech waits for the
@@ -729,7 +737,7 @@ def _handle_chat(text, engine, voice, sink, websocket, loop,
                 return
 
             reply, used_tools = engine.send_with_tools(
-                text, tool_layer.ollama_schema(), tool_layer.execute,
+                text, tool_layer.tool_schema(), tool_layer.execute,
                 collect_images=tool_layer.take_pending_images,
                 preroute_results=pre_results, preroute_images=pre_images)
             used_tools = [u for u in used_tools
@@ -1261,9 +1269,9 @@ async def run_server(engine, voice) -> None:
             await websocket.send(json.dumps({
                 "type": "model_info",
                 "model": getattr(engine.provider, "model",
-                                 settings.OLLAMA_DEFAULT_MODEL),
+                                 settings.LLM_DEFAULT_MODEL),
                 "provider": getattr(engine, "provider_label",
-                                    "Ollama / Local")}))
+                                    "llama.cpp / Local")}))
             await websocket.send(json.dumps({
                 "type": "memory",
                 "facts": memory.load_memory(settings.MEMORY_FILE_PATH)}))
@@ -1430,7 +1438,7 @@ async def run_server(engine, voice) -> None:
                             "type": "model_info",
                             "model": getattr(engine.provider, "model", "?"),
                             "provider": getattr(engine, "provider_label",
-                                                "Ollama / Local")}))
+                                                "llama.cpp / Local")}))
                     except Exception:
                         log.exception("Could not save AI settings")
                 elif msg_type == "set_model":
@@ -1444,7 +1452,7 @@ async def run_server(engine, voice) -> None:
                         log.info("Model switched to %s", want)
                         await websocket.send(json.dumps({
                             "type": "model_info", "model": want,
-                            "provider": "Ollama / Local",
+                            "provider": "llama.cpp / Local",
                             "available": _installed_models()}))
                     else:
                         log.warning("Refused model switch to %r", want)
@@ -1546,8 +1554,19 @@ async def run_server(engine, voice) -> None:
                         if _hotkey is not None and isinstance(combo, str) and combo:
                             ok = _hotkey.rebind(combo)
                             if ok:
-                                log.info("Voice key is now %s "
-                                         "(works from any window)", combo)
+                                # rebind() reports success for an
+                                # unchanged combo even when nothing is
+                                # actually claimed - which on Linux is
+                                # always the case (RegisterHotKey is
+                                # Windows-only), so do not claim "any
+                                # window" unless the key is registered.
+                                if _hotkey.active:
+                                    log.info("Voice key is now %s "
+                                             "(works from any window)", combo)
+                                else:
+                                    log.info("Voice key set to %s; on Linux "
+                                             "a compositor keybind must "
+                                             "send it (see INSTALL.md)", combo)
                             # Either way the panel is told what is actually
                             # registered, which after a failed rebind is the
                             # PREVIOUS key - global_hotkey puts it back
@@ -1613,6 +1632,32 @@ async def run_server(engine, voice) -> None:
                     threading.Thread(target=_log_exceptions(
                         ptt_recorder.stop, "push-to-talk transcription"),
                         daemon=True).start()
+                elif msg_type == "ptt_toggle":
+                    # The Wayland keybind path (niri): a compositor bind
+                    # fires on the key PRESS - the key-up never reaches
+                    # the app - so the global voice key on Linux is a
+                    # toggle: press once to start listening, press again
+                    # to stop and transcribe. Deliberately does NOT claim
+                    # the voice route, unlike ptt_start above: the sender
+                    # is a short-lived script the compositor spawns, and
+                    # letting it claim would steal the reply destination
+                    # from the HUD. The result goes out on the route that
+                    # is already active - exactly what the wake-word
+                    # listener does.
+                    if ptt_recorder.running:
+                        _send_ptt_state(False)
+                        log.info("Voice key up: transcribing (toggle)")
+                        threading.Thread(target=_log_exceptions(
+                            ptt_recorder.stop, "push-to-talk transcription"),
+                            daemon=True).start()
+                    else:
+                        log.info("Voice key down: listening (toggle)")
+                        try:
+                            ptt_recorder.start()
+                            _send_ptt_state(True)
+                        except Exception:
+                            log.exception(
+                                "Could not start recording from the voice key")
                 elif msg_type == "set_wake_word_enabled":
                     enabled = bool(data.get("enabled"))
                     saved = hud_settings.load(settings.HUD_SETTINGS_PATH)

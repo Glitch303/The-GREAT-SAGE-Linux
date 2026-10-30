@@ -35,6 +35,7 @@ until the next game.
 import ctypes
 import ctypes.wintypes as wt
 import logging
+import os
 import threading
 
 log = logging.getLogger(__name__)
@@ -58,6 +59,14 @@ def fullscreen_app():
     reacted to - a mode that changes itself with no explanation is worse
     than one that never changes.
     """
+    if os.name != "nt":
+        # The signal is a borderless fullscreen window owning the
+        # foreground, and Wayland has no generic equivalent: niri's IPC
+        # lists windows but exposes no fullscreen state, so on a panel-less
+        # workspace ANY tiled window would read as a game - a false
+        # positive that would drop 4GB of VRAM for no game at all. Manual
+        # mode switching it is, until a compositor can say otherwise.
+        return None
     try:
         u = ctypes.windll.user32
         hwnd = u.GetForegroundWindow()

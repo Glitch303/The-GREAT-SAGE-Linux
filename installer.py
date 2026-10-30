@@ -2,14 +2,14 @@
 
 Run this instead of run_hud.py on a machine that has not been set up:
 
-    py installer.py
+    .venv/bin/python installer.py
 
-Three of Great Sage's dependencies live outside the application and
-cannot be shipped inside it - the Ollama service, the chat model it
-serves, and Microsoft's WebView2 runtime. Rather than let a tester
-discover that through a blank window or a reply that never arrives, this
-lists them, says how big each one is, and installs the ones that are just
-a command.
+Several of Great Sage's dependencies live outside the application and
+cannot be shipped inside it - the llama.cpp model server and the model it
+serves, and the WebKitGTK runtime the HUD window renders through. Rather
+than let a tester discover that through a blank window or a reply that
+never arrives, this lists them, says how big each one is, and installs
+the ones that are just a command.
 
 Detection lives in great_sage/preflight.py and is shared with the app's
 own startup check, so the two can never disagree about what "ready" means.
@@ -91,8 +91,8 @@ class SetupApi:
     def _run_streaming(self, cmd):
         """Run a command, streaming its output into the page as it goes.
 
-        `ollama pull` is a multi-gigabyte download; without progress the
-        window looks frozen for several minutes and gets killed.
+        A model download is several gigabytes; without progress the window
+        looks frozen for minutes and gets killed.
         """
         self._emit("$ " + " ".join(cmd))
         try:
@@ -109,8 +109,8 @@ class SetupApi:
         last = ""
         for line in p.stdout:
             line = line.rstrip()
-            # Ollama redraws one progress line thousands of times; only
-            # emit real changes or the page drowns in duplicates.
+            # Progress tools redraw one line thousands of times; only emit
+            # real changes or the page drowns in duplicates.
             if line and line != last:
                 self._emit(line)
                 last = line

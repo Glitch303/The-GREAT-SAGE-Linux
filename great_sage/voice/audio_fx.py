@@ -138,13 +138,6 @@ class VoiceFX:
         self._board = None
         self._board_sample_rate: Optional[int] = None
         self._dirty = True
-        self._fresh = True
-
-    def begin_utterance(self) -> None:
-        """Marks the start of a new reply, so the next buffer resets the
-        chain. Without this, a previous reply's reverb tail would bleed
-        into the opening of the next one."""
-        self._fresh = True
 
     @property
     def settings(self) -> FXSettings:
@@ -156,7 +149,6 @@ class VoiceFX:
             if hasattr(self._settings, key):
                 setattr(self._settings, key, value)
         self._dirty = True
-        self._fresh = True  # a rebuilt board starts with no tail state
 
     def _build(self):
         from pedalboard import (
@@ -332,16 +324,17 @@ class VoiceFX:
         if mono_in:
             audio = audio.reshape(1, -1)  # pedalboard wants (channels, frames)
         try:
-            # reset only on the FIRST buffer of an utterance. Resetting
-            # every buffer truncates each effect's tail at the chunk
-            # boundary and restarts the chain cold on the next one, which
-            # is audible as the speech being clipped and then stuttering.
-            # Harmless when a reply was one buffer; very audible once
-            # replies are streamed sentence by sentence. reset=False
-            # carries reverb/delay/flanger state across, so a tail
-            # started in one chunk rings out over the next.
-            out = self._board(audio, float(sample_rate), reset=self._fresh)
-            self._fresh = False
+            # Reset on EVERY buffer, not just the first of a reply. Each
+            # buffer is a separate clip - its own <audio> element in the
+            # HUD, with a websocket round trip between one and the next -
+            # so there is no continuous stream for effect state to carry
+            # across. Carrying it anyway broke the stateful stages: with
+            # the WSOLA pitch shift in the chain, a second or third clip
+            # of the same reply came back at half level or completely
+            # silent (measured). Every synthesized clip already carries a
+            # TAIL_PAD_SECONDS silence tail, so reverb/delay ring out
+            # inside their own clip instead of bleeding into the next.
+            out = self._board(audio, float(sample_rate), reset=True)
         except Exception:
             return samples
         out = out[0] if mono_in else out

@@ -937,3 +937,312 @@ cut attention memory further:
 Then restart Ollama. Deliberately NOT applied automatically: it changes
 Ollama's behaviour for every application on the machine, not just Great
 Sage, and that is the user's decision to make.
+
+---
+
+# Linux port + llama.cpp (started 2026-10-29)
+
+The project is being ported from Windows to Linux (Wayland; the user
+runs Niri), and the model backend is moving from Ollama to llama.cpp.
+Recorded here because it changes several load-bearing assumptions above.
+
+## Why llama.cpp, and the exact shape of it
+
+The user's local server is **llama-swap** (a router in front of a fleet
+of `llama-server` instances), listening on `http://localhost:27906`.
+Probed directly:
+
+- It speaks the **OpenAI-compatible** API: `/v1/chat/completions`,
+  `/v1/models`. There is NO Ollama-compatible surface (`/api/tags`
+  404s), so the provider was rewritten against `/v1`, not re-pointed.
+- It requires an API key (the `apiKeys` list in its config) even on
+  localhost.
+- `chat_template_kwargs: {"enable_thinking": false}` is how thinking is
+  switched off: llama.cpp passes it into the jinja chat template.
+  Verified on Qwen3.8-Orca-27B: thinking off -> clean fast content, no
+  reasoning leak. This replaces Ollama's `think` field.
+- Tool calling works and returns `tool_calls` with `arguments` as a JSON
+  **string** (OpenAI shape), not a dict (Ollama shape). The existing
+  `openai_provider.py` already absorbed exactly this difference, so the
+  new local provider is a thin subclass of it, not a third
+  reimplementation.
+
+## What changed in the code
+
+- `models/ollama_provider.py` deleted. `models/llama_cpp_provider.py`
+  is `LlamaCppProvider(OpenAIProvider)`: base_url defaults to
+  llama-server's own default port (8080), optional key, an empty model
+  name auto-resolves to the first model the server reports (so a fresh
+  checkout works against whatever GGUF is loaded), and `unload()` is a
+  documented no-op (llama.cpp has no unload endpoint; llama-swap's
+  `globalTTL` does the evicting, a bare server is the model).
+- `models/openai_provider.py` generalised: `base_url` param (server
+  ROOT, it appends `/v1` itself), optional key, `think` ->
+  `chat_template_kwargs`, `_model()` seam. Still serves the "openai"
+  online menu entry unchanged.
+- `config/settings.py`: `OLLAMA_HOST` / `OLLAMA_DEFAULT_MODEL` /
+  `OLLAMA_THINK` / `OLLAMA_KEEP_ALIVE_SECONDS` -> `LLM_BASE_URL` /
+  `LLM_DEFAULT_MODEL` / `LLM_THINK`. `ACTIVE_PROVIDER = "llama_cpp"`.
+  The per-request `num_ctx` sizing is gone - context is fixed at server
+  start with `-c`, so the whole juggling was Ollama-specific.
+- **`config/settings_local.py` (git-ignored)** is how the local machine
+  differs from the committed default without committing machine state.
+  Loaded LAST by `settings.py`, which copies its UPPER-CASE constants
+  over the module globals. Two gotchas cost a debugging cycle, so they
+  are written down:
+  1. The file was first named `settings.local.py` - the dot makes it
+     unimportable as `settings_local`. Renamed.
+  2. `from package import submodule` binds the MODULE name only; the
+     constants must be copied over or every `settings.X` read still sees
+     the committed default.
+- `preflight.py`: the two Ollama checks (installed / running) collapsed
+  into one HTTP check on `/v1/models` (401 is the interesting state:
+  server up, key wrong), and the WebView2 registry check became a
+  WebKitGTK import probe (that is what pywebview actually does on
+  Linux).
+
+## Verified
+
+`_smoke_provider.py` (throwaway) ran the full provider surface against
+the live llama-swap: model list (22), send_message, stream_response
+(10 chunks), chat_raw + tools (real `get_time` call, args parsed), and
+auto model-resolve. All pass. First send_message took 16s because
+llama-swap had to spawn + load a fresh 27B instance; warm calls are
+sub-second-to-3s.
+
+## Environment (this machine, for the next session)
+
+- Python 3.14.8, project venv at `.venv/`. torch **2.11.0+cu128**
+  (cu121 has no cp314 wheel; the RTX 5060 Ti is Blackwell and needs
+  cu128 anyway). `torch.cuda.is_available()` is True.
+- GPUs: RTX 5060 Ti (16GB) + RTX A4000 (16GB). The llama.cpp fleet
+  mostly pins `--main-gpu 1` (the A4000).
+- WebKitGTK 4.1 present (pywebview's Linux backend).
+- The app's default model here is `Qwen3.8-Orca-27B-Instruct` (the
+  `--reasoning off` twin of the Orca 27B the user normally runs) - set
+  in `settings_local.py`, so a fresh checkout's committed default
+  stays "first model the server reports".
+
+## WebKit autoplay: the first clip is silent (2026-10-30)
+
+The Windows twin of this gotcha is the Chromium section above; this is
+the Linux half, and it cost a full debugging session too.
+
+**Symptom:** replies triggered by PTT, the wake word, or the startup
+greeting produce no speech, and `great_sage.log` fills with
+`VoiceError: Timed out waiting for the HUD to finish playing audio`
+after a 30s stall. TTS is fine (the server sends a valid WAV over the
+bridge) - the page simply never plays it.
+
+**Mechanism:** the page routes `voiceLineAudio` through
+`createMediaElementSource -> analyser -> audioCtx.destination` so the
+pulse reacts to real amplitude. WebKitGTK's autoplay policy starts
+every page locked (`audioCtx.state === 'suspended'`) until a *trusted*
+gesture (keypress, click, PTT) in the window, and the two engines then
+diverge on exactly the line that was supposed to unlock it:
+
+- Chromium: `resume()` **rejects** without a gesture, so `play()` runs,
+  rejects, and the catch acks. No hang.
+- WebKitGTK 2.54.2 (measured): `resume()` stays **pending** until a
+  gesture arrives. The old chain `resume().then(play)` never reached
+  `play()` - no `'ended'`, no rejection - so the server sat out its
+  full 30s ack timeout in silence.
+
+**Fix (hud_prototype.html, `playServerAudio`):** race `resume()`
+against a 400ms timeout so `play()` always runs; with no gesture yet it
+rejects (`NotAllowedError`) and the catch acks immediately instead of
+stalling 30s. The first real gesture after startup (PTT keypress,
+typing, a click) unlocks the context for everything after.
+
+**Python side (run_hud.py, GTK only):** on pywebview's `shown` event,
+find the nested WebKitWebView and set
+`set_media_playback_requires_user_gesture(False)`. Three things only
+show up by trying:
+
+- Finding the view: `GObject.type_name(widget.__gtype__)` is the only
+  reliable name accessor - `get_type_name()` raises AttributeError on
+  this PyGObject, and `type(w).__name__` is the wrapper name
+  ("WebView"), not the GType ("WebKitWebView").
+- Timing: fire on `shown` (the GTK backend sets it from the webview's
+  `notify::visible`, so the view is guaranteed to exist). A GLib idle
+  source cannot do this job: the page's constant rAF render loop
+  starves idle callbacks (the old retry source managed about eight
+  attempts in four minutes). pywebview 6 also never fires
+  `events.loaded` on GTK, and its `start()` func hook runs on a worker
+  thread before the loop even starts.
+- **The property is inert on this build (measured, WebKitGTK 2.54.2):**
+  it defaults to False, and with it False the `autoplay` attribute is
+  ignored - `play()` still rejects and `resume()` still hangs pending.
+  So the first clip is skipped *silently, with a prompt ack*, and
+  speech unlocks on the first typing/click on the HUD. The call is kept
+  anyway: it is the documented knob, and a WebKit build that honours it
+  gets gesture-free startup audio for free.
+
+**Resulting behaviour (documented, not a bug):** on the Linux build the
+first reply after startup is silent; after the user's first
+interaction with the HUD, all speech is audible.
+
+**Test note:** feeding the wake word without a human voice is awkward
+on this machine. The only usable loopback (the iBasso monitor source,
+`alsa_output.usb-ibasso_...analog-stereo.monitor`) is fixed at 48kHz
+and PortAudio's Pulse backend won't open it at the listener's 16kHz
+(probed: 16k/24k fail with `Invalid sample rate`, 48k OK). Say the
+phrase into the REXUS mic instead.
+
+## WebKit preroll: every clip starts ~1.3s late (2026-10-30)
+
+A second WebKitGTK-only audio gate, found right after the autoplay one
+above, with a subtler symptom: the first clip of a reply sounds
+truncated (missing its first word), and on a multi-clip reply the
+damage looks random.
+
+**Cause:** a `<audio>` element wired into the Web Audio graph
+(`createMediaElementSource`) is fed by a GStreamer pipeline, and that
+pipeline **prerolls** before audio flows. Measured on this machine
+(WebKitGTK 2.54.2, WebKitGTK 4.1): the first **1.109-1.13s** of every
+clip is eaten before playback begins. No element-side trick avoids it
+- seeking re-offsets the preroll, reassigning `src` re-prerolls, and a
+clip shorter than the preroll is eaten whole. Windows
+(WebView2/Chromium) has no such preroll, so this is Linux-only, like
+the autoplay gate.
+
+**Fix (browser_sink.py):** on Linux, every WAV sent to the HUD gets
+1.3s of silence prepended (`WEBKIT_PREROLL_PREBUF_SECONDS`, selected
+by `sys.platform`) so the preroll eats silence instead of the first
+words; the user hears ~0.2s of lead-in, which is what a natural
+utterance has anyway. The ack deadline is lengthened by the same
+amount. The padding is off on Windows, where the preroll doesn't
+exist.
+
+**Second bug found while verifying:** `audio_fx.py` reset its effect
+chain only on the FIRST buffer of a reply. Each buffer is a separate
+clip (its own `<audio>` element, a websocket round trip between clips)
+- there is no continuous stream for state to carry across. Carrying it
+broke the stateful stages: with the WSOLA pitch shift in the chain,
+clip 2 or 3 of a reply came back at half level or completely silent
+(measured: 0.000/0.069 peaks on 0.79s clips that should have been
+full). Fix: `reset=True` on EVERY buffer. Ring-out no longer bleeds
+between clips either, because every synthesized clip already carries a
+`TAIL_PAD_SECONDS` silence tail that soaks the reverb/delay inside its
+own clip.
+
+**Verified end-to-end** (websocket probe, 27B model, 4-clip reply with
+two voice-line clips + two F5 clips): all four clips carried content
+(peaks 0.13-0.96, no silent clip), each started after its 1.3s
+prebuf, and the ack flow completed in 18s with no 30s timeout.
+
+## Jinja 500: system message must be at the beginning (2026-10-30)
+
+**Symptom:** every chat reply failed with `ModelProviderError: the
+llama.cpp server returned HTTP 500`, and the llama-swap journal showed
+the real cause: `Jinja Exception: System message must be at the
+beginning` (a `raise_exception` inside the Qwen chat template). Hit BOTH
+models (Qwen3.5-9B and Qwen3.8-Orca-27B) - it is a request-shape
+problem, not a model problem.
+
+**Root cause:** the Qwen templates run through llama.cpp with `--jinja`
+require any `system` message to be the FIRST message in the array.
+`chat_engine._build_outgoing` injected two per-turn `system` messages
+AFTER the conversation (the memory-recall block and the `state_hint`
+pitch line) right before the user's turn, and `send_with_tools` injected
+a third (the preroute tool-results note). The requests were fine while
+recall and the hint were empty - which is why early tests passed and
+the failures started only once memory had accumulated facts. Ollama
+tolerated mid-conversation system messages, so the shape never showed
+up there.
+
+**Fix:** `chat_engine.py` now merges the recall block and the state
+hint INTO the leading system message (the copy sent, never
+`self.history`), and the preroute note in `send_with_tools` is merged
+the same way. The per-turn property is preserved: recall is still
+re-selected fresh every turn and nothing is stored in history.
+
+**Verified:** throwaway replay of the exact app request shape (stream +
+`enable_thinking: False`) at llama-swap - old shape 500 on both models,
+new shape 200 on both. `check_routing.py` 49/49. Live app: the
+previously-failing `write an essay about life in 100 words` completed in
+15.5s.
+
+**Rule for future code:** anything that goes to a Qwen model via
+llama.cpp `--jinja` may carry exactly one system message, at index 0.
+Do not add mid-conversation system turns (or, for a new provider,
+check its template's system-message constraint before reusing this
+engine's shapes).
+
+## Global voice key on Linux: the niri keybind path (2026-10-30)
+
+**Symptom:** the settings "voice key" rebind reported every combination
+as already in use - `alt+enter`, `alt+n`, `alt+b`, `alt+v`, `alt+x`,
+`alt+z`, `alt+capslock`, `alt+f1`, `f2`, `f3`, all "could not be
+registered" - while voice input still worked, via the wake word.
+
+**Root cause:** `GlobalHotkey` is Windows-only (`RegisterHotKey`). On
+Wayland no key can be claimed, and two things made that invisible:
+(1) `rebind()` reports success for an *unchanged* combo, so saving a
+setting printed "Voice key is now alt+1 (works from any window)" with
+nothing actually registered, and (2) every *different* combo failed
+against the previous one and was logged as "already in use" - a
+misleading message, because nothing was in use.
+
+**Fix (what actually works on niri now):** the key lives in the
+compositor, not the app.
+
+```kdl
+# ~/.config/niri/dms/binds.kdl
+Alt+F5 hotkey-overlay-title="Great Sage: voice" { spawn "<repo>/gs_hotkey.py" "ptt_toggle"; }
+```
+
+- `gs_hotkey.py` (repo root, venv shebang): connects to
+  `ws://localhost:8765` and sends `{"type": "ptt_toggle"}` (or
+  `ptt_start`/`ptt_stop`). Near-instant on purpose - it does NOT import
+  `great_sage.server` just for the port (that drags in torch).
+- `ptt_toggle` handler in `server.py`: niri binds fire on the PRESS
+  only (the key-up never reaches the app), so the Linux key is a
+  toggle - press once to listen, press again to stop + transcribe.
+  It deliberately does NOT claim the voice route, unlike `ptt_start`:
+  the sender is a short-lived spawned connection, and letting it claim
+  would steal the reply destination from the HUD. Results go out on the
+  route the HUD's `hello` already claimed - the same path the wake word
+  uses.
+- `PushToTalkRecorder.running` property added for the toggle state
+  (clears on stop before transcription, so a fast re-press starts a
+  fresh recording without waiting for the previous text).
+- The "Voice key is now X (works from any window)" log now only claims
+  that when `_hotkey.active` is actually true.
+
+More key combos = more `binds` entries spawning `gs_hotkey.py`. Niri
+accepts three-button combos (`Ctrl+Alt+Shift+X`), so the two-button
+space being taken is not a limit.
+
+**Verified:** `check_routing.py` 49/49 (plus js/shaders); live smoke -
+two `gs_hotkey.py` pokes logged "Voice key down: listening (toggle)"
+-> 2.6s recorded -> "Voice key up: transcribing (toggle)" ->
+faster-whisper ran; niri reloaded the config without errors.
+
+**Also stale, fixed in passing:** the "Ctrl+Alt+S from any window"
+section above says the Windows key is a TOGGLE. That was true briefly;
+Krazaa asked for the hold back (see `global_hotkey.py` - press from
+RegisterHotKey, release from GetAsyncKeyState polled only while the key
+is down). Windows = hold to talk; Linux = toggle, by mechanism.
+
+## Still to do (the port is NOT finished)
+
+- **Phase 1 (current):** `run_hud.py`'s Win32 window ops (frameless
+  toggle, `WM_NCLBUTTONDOWN` drag, `FindWindowW`, work-area placement)
+  -> GTK/WebKitGTK equivalents; `app.py`'s `MessageBoxW`. (The
+  autoplay half is done - see the WebKit section above: the
+  `media-playback-requires-user-gesture` setting is inert on
+  WebKitGTK 2.54.2, and the page now acks the first silent clip
+  promptly.)
+- **Phase 2:** the transparent overlay as a **wlr-layer-shell surface**
+  (Niri implements it; there is NO native always-on-top for ordinary
+  xdg toplevels - niri-wm/niri#932). Click-through via
+  `xdg_toplevel.set_input_region` (the rectangular "core" hit area), not
+  the polled `WS_EX_TRANSPARENT`. Global hotkey via a niri `binds`
+  entry. Window awareness (tools, game-watch) via
+  wlr-foreign-toplevel-management.
+- **Phase 3:** packaging (single PyInstaller build on Linux, `.desktop`
+  file, no WebView2/shortcut steps).
+- Known Niri gotcha for the HUD: enable `prefer-no-csd`, otherwise the
+  compositor draws focus rings/borders *behind* the window and they
+  show through the translucent HUD.

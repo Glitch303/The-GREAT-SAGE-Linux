@@ -12,6 +12,9 @@ ENV/
 # Secrets / local environment overrides
 .env
 *.env.local
+# Per-machine settings (llama-swap URL/key/model) - see the loader at the
+# bottom of config/settings.py.
+settings_local.py
 
 # Voice samples, split by what they are FOR.
 #

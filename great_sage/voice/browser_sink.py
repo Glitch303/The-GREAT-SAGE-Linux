@@ -15,10 +15,53 @@ protocol docstring for the full message shapes.
 import asyncio
 import base64
 import json
+import os
+import sys
 import threading
 
 from great_sage.voice.base import VoiceError
 from great_sage.voice.sinks import AudioSink
+
+# WebKitGTK (the HUD on Linux) starts every <audio> element wired into the
+# Web Audio graph ~1.11s into its clip: its GStreamer pipeline prerolls
+# that far before audio starts, and no element-side trick avoids it
+# (seeking re-offsets, reassigning src re-prerolls, and a clip shorter
+# than the preroll is eaten whole). So on Linux every WAV sent to the HUD
+# gets this much silence prepended - the preroll eats silence instead of
+# the first words, and the user hears ~0.2s of lead-in, which is what a
+# natural utterance has anyway. Measured 1.109-1.13s of preroll on this
+# machine (probe history in NOTES.md), so 1.3s covers it with margin.
+# Windows (WebView2/Chromium) has no such preroll, so the padding stays
+# off there.
+WEBKIT_PREROLL_PREBUF_SECONDS = 1.3
+
+
+def _webkit_preroll_prebuf() -> float:
+    """Prebuffer length for this platform's HUD engine, in seconds."""
+    if sys.platform.startswith("linux"):
+        return WEBKIT_PREROLL_PREBUF_SECONDS
+    return 0.0
+
+
+def _prepend_silence(data: bytes, seconds: float):
+    """Prepend `seconds` of silence to a WAV clip (WAV in, WAV out).
+
+    Returns (data, seconds actually prepended).
+    """
+    if not seconds:
+        return data, 0.0
+    import io
+
+    import numpy as np
+    import soundfile as sf
+
+    samples, rate = sf.read(io.BytesIO(data), dtype="float32")
+    silence = np.zeros(int(seconds * rate), dtype="float32")
+    if samples.ndim == 2:
+        silence = np.repeat(silence[:, None], samples.shape[1], axis=1)
+    buf = io.BytesIO()
+    sf.write(buf, np.concatenate([silence, samples]), rate, format="WAV")
+    return buf.getvalue(), seconds
 
 # How long to wait for the client's "finished playing" ack BEYOND the
 # clip's own length. This is a dead-client detector - a browser that
@@ -63,6 +106,11 @@ class BrowserAudioSink(AudioSink):
         """
         text = self.pending_text
         self.pending_text = None
+        # The HUD's WebKit preroll eats the clip's head; hand it silence to
+        # eat instead (no-op on platforms without the preroll).
+        prebuf = 0.0
+        if mime == "audio/wav":
+            data, prebuf = _prepend_silence(data, _webkit_preroll_prebuf())
         payload = json.dumps({
             "type": "audio",
             "mime": mime,
@@ -77,13 +125,14 @@ class BrowserAudioSink(AudioSink):
         # floor, so a very short clip keeps a sane grace period.
         deadline = ACK_TIMEOUT_SECONDS
         if duration and duration > 0:
-            deadline = max(deadline, duration + ACK_TIMEOUT_MARGIN_SECONDS)
+            deadline = max(deadline, duration + prebuf + ACK_TIMEOUT_MARGIN_SECONDS)
         if not self._ack_event.wait(timeout=deadline):
             raise VoiceError(
                 "Timed out waiting for the HUD to finish playing audio "
                 "(waited %.0fs for a %s clip)." % (
                     deadline,
-                    "%.1fs" % duration if duration else "clip of unknown length"))
+                    "%.1fs" % (duration + prebuf) if duration
+                    else "clip of unknown length"))
 
     def play(self, samples, samplerate: int) -> None:
         import io

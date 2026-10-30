@@ -46,7 +46,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from great_sage.config import settings                       # noqa: E402
 from great_sage.core import guardrails, personality           # noqa: E402
 from great_sage.core.chat_engine import ChatEngine            # noqa: E402
-from great_sage.models.ollama_provider import OllamaProvider  # noqa: E402
+from great_sage.models.llama_cpp_provider import LlamaCppProvider  # noqa: E402
 import main                                                   # noqa: E402
 
 CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -152,8 +152,9 @@ def main_run(full: bool, model: str):
     prompt = main.build_system_prompt()
     protected = settings.SYSTEM_PROMPT + personality.render(
         personality.current_state())
-    provider = OllamaProvider(host=settings.OLLAMA_HOST, model=model,
-                              timeout=300, think=settings.OLLAMA_THINK)
+    provider = LlamaCppProvider(base_url=settings.LLM_BASE_URL,
+                                api_key=settings.LLM_API_KEY, model=model,
+                                timeout=300, think=settings.LLM_THINK)
 
     print("model            : %s" % model)
     print("system prompt    : %d chars" % len(prompt))

@@ -18,8 +18,8 @@ PRIVATE and ONLINE are about WHERE data goes; the rest are about what is
 spent. They are kept in one list anyway, because a mode the user has to
 combine by hand is a mode they will get wrong.
 
-Nothing here talks to the HUD or to Ollama directly - a mode only
-describes limits, and the server applies them. That keeps the policy
+Nothing here talks to the HUD or to the model server directly - a mode
+only describes limits, and the server applies them. That keeps the policy
 readable in one place instead of scattered through the code that enforces
 it.
 """

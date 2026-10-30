@@ -4,8 +4,8 @@ Checks prerequisites first. If anything essential is missing it shows the
 setup window; otherwise it goes straight to the HUD, so a machine that is
 already set up never sees a splash it has to click through.
 
-Run from source:   py app.py
-Force setup:       py app.py --setup
+Run from source:   .venv/bin/python app.py
+Force setup:       .venv/bin/python app.py --setup
 
 Everything is done in ONE process rather than launching a second one. In a
 frozen build sys.executable is the exe itself, so re-launching a .py file
@@ -64,7 +64,16 @@ def main() -> int:
     # build there is no overlay_window.py to launch - so the exe re-invokes
     # ITSELF with this flag and becomes the Qt host instead. Checked before
     # anything else, since none of the HUD's startup applies to it.
+    #
+    # On Linux the overlay host is the layer-shell binary in overlay/,
+    # which run_hud launches directly - it never re-enters through this
+    # flag, so reaching it here means a stale command line.
     if "--overlay" in sys.argv:
+        if sys.platform != "win32":
+            sys.stderr.write("Great Sage: --overlay is a Windows-build flag; "
+                             "the Linux overlay host is overlay/"
+                             "great_sage_overlay, launched by the HUD itself.\n")
+            return 2
         import overlay_window
         sys.argv = [a for a in sys.argv if a != "--overlay"]
         return overlay_window.main()
@@ -109,13 +118,21 @@ if __name__ == "__main__":
             pass
         logging.getLogger("great_sage.app").critical(
             "Great Sage failed to start:\n%s", traceback.format_exc())
+        message = ("Great Sage could not start.\n\n"
+                   "Details were written to:\n" + LOG_PATH)
         try:
-            import ctypes
-            ctypes.windll.user32.MessageBoxW(
-                None,
-                "Great Sage could not start.\n\nDetails were written to:\n"
-                + LOG_PATH,
-                "Great Sage", 0x10)
+            import shutil
+            import subprocess
+            if sys.platform == "win32":
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(None, message,
+                                                 "Great Sage", 0x10)
+            elif shutil.which("zenity"):
+                subprocess.run(["zenity", "--error",
+                                "--title=Great Sage", "--text=" + message],
+                               timeout=180)
+            else:
+                print(message)
         except Exception:
             pass
         raise SystemExit(2)

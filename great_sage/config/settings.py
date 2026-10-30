@@ -10,85 +10,55 @@ import os
 import sys
 
 # --- Provider selection -----------------------------------------------
-# Only "ollama" exists today. This string is read by main.py to decide
-# which ModelProvider implementation to construct. Adding "openai" or
-# "anthropic" later just means adding a branch there and a new
-# provider class in models/ - nothing else in the app needs to change.
-ACTIVE_PROVIDER = "ollama"
+# "llama_cpp" is the local provider (llama-server, or a router in front
+# of it such as llama-swap, over its OpenAI-compatible API). "openai" and
+# "anthropic" are the online options in the HUD's AI settings. This
+# string is read by main.py to decide which ModelProvider to construct.
+ACTIVE_PROVIDER = "llama_cpp"
 
-# --- Ollama settings -----------------------------------------------
-OLLAMA_HOST = os.environ.get("GREAT_SAGE_OLLAMA_HOST", "http://localhost:11434")
-# qwen3.5:4b is the model, and the ONLY one installed. The lineage that
-# got here, each step a head-to-head on this project's own system prompt:
-# llama3 -> qwen3:8b -> qwen2.5:3b -> qwen3.5:4b.
-#
-# Two rejections are worth keeping, because both look fine on paper:
-#
-#   llama3.2:3b INVENTS. It answered a question about a football result
-#   and one about a street's population with confident fabrications - the
-#   single failure mode core/personality.py's confidence ladder exists to
-#   prevent.
-#
-#   qwen3:4b is UNUSABLE HERE, and not for lack of capability - it is a
-#   reasoning model that mishandles think=False. Measured on one question:
-#     think=False            -> 13415 chars of chain-of-thought in the
-#                               CONTENT field, thinking field empty
-#     think=False + /no_think ->  7012 chars, still in content
-#     no think field          ->     9 chars, correctly separated, but 69s
-#   There is no setting where it is both clean and fast, and in the
-#   default configuration its entire monologue would be SPOKEN ALOUD.
-#   Do not reach for a small qwen3 variant to save VRAM; see OLLAMA_THINK.
-#
-# Markdown still leaks when a question invites a list or code. Handled
-# downstream by voice/speakable.py, which strips unspeakable markup on the
-# way to TTS rather than by hardening the prompt, which only reached 1/3.
-#
-# There is deliberately NO local fallback model any more. Carrying a
-# second one cost 1.9GB on disk to hedge against a switch that has not
-# been needed, and if the local model is ever the problem the answer is an
-# API provider in Chat Mode's AI settings, not a weaker local one.
-# Measured on this machine (RTX 3060, 12.9GB) against the spec S34
-# role test, with F5-TTS resident at 0.8GB:
-#
-#   model         VRAM   load   warm   S34 role test
-#   qwen2.5:3b    2.2GB  4.2s   1.2s   FAILED - claimed it would build it
-#   qwen2.5:7b    4.7GB  11.7s  1.4s   correct but terse
-#   qwen3.5:4b    3.1GB  4.2s   1.3s   correct, and volunteers that
-#                                      the capability is absent
-#   llama3        5.0GB    -      -    worse than 3b on ordering
-#   qwen3.5:27b   17 GB    -      -    does NOT fit this card
-#
-# qwen3.5:4b also carries VISION (verified: it read a screenshot and
-# named the app, a URL and filenames), so screen awareness costs no
-# extra VRAM. And unlike qwen3:4b it does not leak raw reasoning.
-#
-# 3.1 + 0.8 = 3.9GB leaves ~9GB free, which is the point: Krazaa
-# games and calls while this runs.
-#
-# To go back without editing this file:
-#   set GREAT_SAGE_OLLAMA_MODEL=<some other pulled model>
-OLLAMA_DEFAULT_MODEL = os.environ.get("GREAT_SAGE_OLLAMA_MODEL", "qwen3.5:4b")
+# --- LLM server (llama.cpp) settings ----------------------------------
+# Where the local model server listens. The default is llama.cpp's own
+# default port (8080), so a fresh GitHub checkout points at a bare
+# `llama-server` and works with no editing. A different port - or a
+# router such as llama-swap - lives in settings.local.py (git-ignored,
+# loaded at the bottom of this file) or in the env var.
+LLM_BASE_URL = os.environ.get("GREAT_SAGE_LLM_BASE_URL", "http://localhost:8080")
 
-# Reasoning models deliberate before answering, and Ollama streams that
-# deliberation on a separate channel - so the content stream stays silent
-# until it finishes. For a spoken assistant that is dead air.
+# API key for the server. A bare llama-server needs none; a router such
+# as llama-swap may require one (the apiKeys list in its config).
+LLM_API_KEY = os.environ.get("GREAT_SAGE_LLM_API_KEY", "")
+
+# The model to chat with. For a bare llama-server this is whatever its
+# GET /v1/models reports (the loaded GGUF); for a router, one of the
+# router's model names. Empty = the first model the server reports, so a
+# fresh checkout works against whatever is loaded.
+#
+# The Ollama-era model lineage and its measurements (why a Qwen3.5-class
+# model, and what got rejected and why) are in NOTES.md. The conclusions
+# carry over: the model must pass the S34 role test and keep its
+# reasoning out of the spoken content.
+LLM_DEFAULT_MODEL = os.environ.get("GREAT_SAGE_LLM_MODEL", "")
+
+# Reasoning models deliberate before answering, and the deliberation is
+# parsed into its own channel - so the content stream stays silent until
+# it finishes. For a spoken assistant that is dead air.
 #
 # Measured on qwen3:8b, same question:
 #     think on  -> first content 14.13s (857 chars of private reasoning)
 #     think off -> first content  1.15s
 #
-# Off by default. Ignored by models that have no thinking mode - which
-# includes the current default, qwen2.5:3b - so it is safe to leave set,
-# and it stays correct if you revert to qwen3:8b.
+# Off by default. Sent to llama.cpp as
+# chat_template_kwargs={"enable_thinking": False}; templates that never
+# reference the variable ignore it, so non-reasoning models behave
+# exactly as before.
 #
 # WARNING: "ignored" is only true of non-reasoning models. A reasoning
-# model may honour think=False by not SEPARATING its reasoning rather than
-# by skipping it, dumping the whole monologue into content where it gets
-# spoken aloud. qwen3:4b does exactly that (13415 chars; see the model
-# note above). Before switching to any reasoning model, verify that
-# think=False actually suppresses deliberation rather than just unwrapping
-# it.
-OLLAMA_THINK = False
+# model may honour think=False by not SEPARATING its reasoning rather
+# than by skipping it, dumping the whole monologue into content where it
+# gets spoken aloud. Before switching to any reasoning model, verify that
+# think=False actually suppresses deliberation rather than just
+# unwrapping it.
+LLM_THINK = False
 
 # --- Conversation behavior --------------------------------------------
 # On-screen chat stays in English; CLONE_TRANSLATE below handles turning
@@ -422,7 +392,7 @@ HUD_BACKGROUND_COLOR = "#070d14"
 # on qwen3:8b.
 GUARDRAILS_SELF_REVIEW = True
 
-# Network timeouts, in seconds, for talking to the local Ollama server.
+# Network timeouts, in seconds, for talking to the local model server.
 REQUEST_TIMEOUT_SECONDS = 60
 
 # Minutes of silence after which the next message counts as a fresh
@@ -541,18 +511,11 @@ TASKS_PATH = _user_file("tasks.json")
 # Set to "" to switch it off.
 GLOBAL_HOTKEY = os.environ.get("GREAT_SAGE_HOTKEY", "ctrl+alt+s")
 
-# How long Ollama holds the model in VRAM after a reply, in seconds.
-#
-# Ollama defaults to 300 (five minutes). Measured here, the model is
-# 3.0-3.6GB depending on context size, so five minutes of idle residency
-# is five minutes of a game not having that memory. 120 keeps it warm
-# across a normal back-and-forth - replies inside two minutes of each
-# other pay nothing - while giving the card back much sooner once the
-# conversation stops.
-#
-# GAMING and SLEEP override this with 0 (unload immediately); see
-# core/modes.py. Set to None to use Ollama own default.
-OLLAMA_KEEP_ALIVE_SECONDS = 120
+# Note on VRAM residency: Ollama had a keep_alive dial; llama.cpp does
+# not. A bare llama-server holds its model for its whole life, and
+# llama-swap evicts an idle instance after its own TTL (globalTTL in its
+# config). The GAMING/SLEEP modes' unload request is therefore a
+# best-effort no-op - see LlamaCppProvider.unload() and core/modes.py.
 
 # The tool layer (spec S23-S26): let Great Sage read the clock, check
 # the machine, open links, launch installed applications and find files.
@@ -694,7 +657,9 @@ F5_SPEED = 0.92
 F5_CHUNK_THRESHOLD_CHARS = 260
 F5_CHUNK_TARGET_CHARS = 220
 
-# "cuda", "cpu", or None to auto-detect (uses your GPU if torch sees one).
+# "cuda", "cpu", a GPU index (1 for the second card), or None to
+# auto-detect. The index is the dual-GPU case: the chat model owns the
+# default GPU and the voice model has to live on the other one.
 CLONE_DEVICE = None
 
 # --- Voice lines (pre-recorded clips) -----------------------------------
@@ -779,3 +744,26 @@ VOICE_LINES = [
     (r"Not yet acquired\.", os.path.join(VOICE_LINES_DIR, "mishutoku.ogg")),
     (r"Target confirmed\.", os.path.join(VOICE_LINES_DIR, "taishou_kakunin.ogg")),
 ]
+
+# --- Per-machine overrides (NOT committed) ------------------------------
+# settings_local.py may redefine any of the above for THIS machine only.
+# It is git-ignored, so the committed defaults stay the stock setup
+# (a bare llama-server on its own default port, no key, first loaded
+# model) while a local router, API key and model name live here. Loaded
+# LAST, so it wins over the env vars above. Restart applies it.
+#
+# Note: importing the module only binds the MODULE name here - the
+# constants must be copied over, or every `settings.X` read elsewhere
+# would still see the committed default. Settings are upper-case, so
+# that is the copy criterion.
+def _apply_local_overrides() -> None:
+    try:
+        from great_sage.config import settings_local
+    except ImportError:
+        return
+    for _name in dir(settings_local):
+        if _name.isupper():
+            globals()[_name] = getattr(settings_local, _name)
+
+_apply_local_overrides()
+del _apply_local_overrides

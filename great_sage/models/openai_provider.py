@@ -1,9 +1,11 @@
-r"""OpenAI's chat API behind the same ModelProvider seam.
+r"""An OpenAI-compatible chat API behind the same ModelProvider seam.
 
-The settings pane offered "openai" as a provider before this existed, and
-picking it silently fell back to the local model. A menu entry that
-quietly does nothing is worse than a shorter menu - so either this file
-had to exist or the option had to go.
+Two things sit behind this class:
+
+  - api.openai.com itself (the "openai" entry in the HUD's AI settings)
+  - any local OpenAI-compatible server: llama.cpp's `llama-server`, or a
+    router in front of it such as llama-swap (the "llama_cpp" local
+    provider - see llama_cpp_provider.py)
 
 Shape differences from Ollama, absorbed here:
 
@@ -25,25 +27,47 @@ from great_sage.models.base import Message, ModelProvider, ModelProviderError
 
 log = logging.getLogger(__name__)
 
-API_URL = "https://api.openai.com/v1/chat/completions"
+# The SERVER ROOT, not the API root: both api.openai.com and a local
+# llama.cpp server expose their OpenAI-compatible API under /v1.
+DEFAULT_BASE_URL = "https://api.openai.com"
 DEFAULT_MODEL = "gpt-4o-mini"
 
 
 class OpenAIProvider(ModelProvider):
-    def __init__(self, api_key: str, model: str = "", timeout: int = 90):
-        if not api_key:
+    def __init__(self, api_key: str = "", model: str = "", timeout: int = 90,
+                 base_url: str = DEFAULT_BASE_URL, think: bool = None,
+                 name: str = "OpenAI"):
+        """think is sent as chat_template_kwargs={"enable_thinking": ...}
+        when it is not None - llama.cpp passes it into the model's jinja
+        chat template, where Qwen3-family models honour it and templates
+        that never reference the variable ignore it. None (the default)
+        sends nothing, which is what api.openai.com wants.
+
+        name is how the error messages refer to the server, because the
+        same failure text serves both "OpenAI" and "the llama.cpp
+        server".
+        """
+        if not api_key and base_url == DEFAULT_BASE_URL:
             raise ModelProviderError("No OpenAI API key is set.")
         self.api_key = api_key
-        self.model = model or DEFAULT_MODEL
+        self.model = model
         self.timeout = timeout
+        self.base_url = base_url.rstrip("/")
+        self.think = think
+        self.name = name
+
+    def _model(self) -> str:
+        return self.model or DEFAULT_MODEL
 
     @staticmethod
     def supports_tools() -> bool:
         return True
 
     def _headers(self):
-        return {"Authorization": "Bearer " + self.api_key,
-                "Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = "Bearer " + self.api_key
+        return headers
 
     def _convert(self, messages: List[Message]):
         out = []
@@ -70,23 +94,33 @@ class OpenAIProvider(ModelProvider):
             out.append(entry)
         return out
 
+    def _body(self, messages: List[Message], **extra) -> dict:
+        body = {"model": self._model(),
+                "messages": self._convert(messages)}
+        if self.think is not None:
+            body["chat_template_kwargs"] = {"enable_thinking": bool(self.think)}
+        body.update(extra)
+        return body
+
     def _fail(self, exc, response=None):
         """Never let the key reach a log line or an error message."""
         if response is not None:
             if response.status_code == 401:
                 return ModelProviderError(
-                    "OpenAI rejected the API key. Check it in AI settings.")
+                    "%s rejected the API key. Check it in the settings."
+                    % self.name)
             if response.status_code == 429:
                 return ModelProviderError(
-                    "OpenAI rate limit reached. Try again shortly.")
+                    "%s rate limit reached. Try again shortly." % self.name)
             return ModelProviderError(
-                "OpenAI returned HTTP %s." % response.status_code)
-        return ModelProviderError("Could not reach OpenAI: %s"
-                                  % type(exc).__name__)
+                "%s returned HTTP %s." % (self.name, response.status_code))
+        return ModelProviderError("Could not reach %s: %s"
+                                  % (self.name, type(exc).__name__))
 
     def _post(self, body, stream=False):
         try:
-            r = requests.post(API_URL, headers=self._headers(), json=body,
+            r = requests.post(self.base_url + "/v1/chat/completions",
+                              headers=self._headers(), json=body,
                               timeout=self.timeout, stream=stream)
         except Exception as exc:
             raise self._fail(exc) from exc
@@ -95,17 +129,17 @@ class OpenAIProvider(ModelProvider):
         return r
 
     def send_message(self, messages: List[Message]) -> str:
-        r = self._post({"model": self.model,
-                        "messages": self._convert(messages)})
+        r = self._post(self._body(messages))
         try:
             return r.json()["choices"][0]["message"].get("content") or ""
         except Exception as exc:
             raise ModelProviderError(
-                "OpenAI returned an unexpected response format.") from exc
+                "%s returned an unexpected response format." % self.name
+            ) from exc
 
     def chat_raw(self, messages, tools=None):
         """Ollama-shaped message dict, so the tool loop needs no changes."""
-        body = {"model": self.model, "messages": self._convert(messages)}
+        body = self._body(messages)
         if tools:
             body["tools"] = tools
         r = self._post(body)
@@ -113,7 +147,8 @@ class OpenAIProvider(ModelProvider):
             msg = r.json()["choices"][0]["message"]
         except Exception as exc:
             raise ModelProviderError(
-                "OpenAI returned an unexpected response format.") from exc
+                "%s returned an unexpected response format." % self.name
+            ) from exc
         out = {"role": "assistant", "content": msg.get("content") or ""}
         calls = msg.get("tool_calls") or []
         if calls:
@@ -129,9 +164,7 @@ class OpenAIProvider(ModelProvider):
         return out
 
     def stream_response(self, messages: List[Message]) -> Iterator[str]:
-        r = self._post({"model": self.model,
-                        "messages": self._convert(messages), "stream": True},
-                       stream=True)
+        r = self._post(self._body(messages, stream=True), stream=True)
         for line in r.iter_lines():
             if not line or not line.startswith(b"data:"):
                 continue
@@ -147,7 +180,31 @@ class OpenAIProvider(ModelProvider):
                 yield text
 
     def get_available_models(self) -> List[str]:
-        return ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"]
+        """What the server reports. The /v1/models endpoint is the same on
+        api.openai.com, a bare llama-server and a router such as
+        llama-swap, so one fetch serves all three."""
+        try:
+            r = requests.get(self.base_url + "/v1/models",
+                             headers=self._headers(), timeout=self.timeout)
+        except Exception as exc:
+            raise self._fail(exc) from exc
+        if r.status_code != 200:
+            raise self._fail(None, r)
+        try:
+            return sorted(m["id"] for m in r.json()["data"])
+        except Exception as exc:
+            raise ModelProviderError(
+                "%s returned an unexpected response format." % self.name
+            ) from exc
+
+    def unload(self) -> bool:
+        """Free the model from GPU memory, if the backend can.
+
+        The OpenAI API has no unload, and for api.openai.com there is
+        nothing local to free - so a no-op is correct here. The local
+        provider documents its own reality in its override.
+        """
+        return True
 
 
 def _parse_args(raw):

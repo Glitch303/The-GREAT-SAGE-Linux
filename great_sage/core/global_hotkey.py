@@ -43,6 +43,7 @@ pumping messages to receive them.
 import ctypes
 import ctypes.wintypes as wt
 import logging
+import os
 import threading
 import time
 
@@ -110,6 +111,18 @@ class GlobalHotkey:
         self._ok = False
 
     def start(self) -> bool:
+        if os.name != "nt":
+            # RegisterHotKey is Windows-only, and the Wayland equivalents
+            # are compositor-private. The supported Linux path is a niri
+            # keybind that sends ptt_start/ptt_stop over the server socket
+            # (see INSTALL.md) - until that lands, the HUD's own mic
+            # button and the wake word are the ways in.
+            log.info("Global hotkey %r not registered automatically on "
+                     "Linux (niri keybind path, see INSTALL.md)",
+                     self.binding)
+            self._ok = False
+            self._ready.set()
+            return False
         parsed = parse(self.binding)
         if parsed is None:
             log.warning("Global hotkey %r could not be parsed", self.binding)

@@ -3,14 +3,19 @@
 # IMPORTANT: install torch FIRST, with the right CUDA build for your GPU,
 # then everything below. Pip will leave an existing CUDA torch alone; let
 # it resolve torch itself and you get the CPU build, which makes F5-TTS
-# far too slow to speak in real time.
+# far too slow to speak in real time. cu128 covers every NVIDIA card up
+# to and including Blackwell (RTX 50); older cards can use their own cu
+# index. (The old cu121 line predates Python 3.14 wheels and Blackwell.)
 #
-#   pip install torch --index-url https://download.pytorch.org/whl/cu121
-#   pip install -r requirements.txt
+#   .venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cu128
+#   .venv/bin/pip install -r requirements.txt
 #
-# NOT a Python dependency, and NOT bundleable: Ollama must be installed
-# separately and the model pulled once -
-#   https://ollama.com/download   then:  ollama pull qwen2.5:3b
+# NOT a Python dependency, and NOT bundleable: a llama.cpp model server
+# must run separately (or a router such as llama-swap in front of it) -
+#   https://github.com/ggml-org/llama.cpp  then:  llama-server -m <model.gguf> --jinja
+# The app looks at http://localhost:8080 (llama-server's default port)
+# unless LLM_BASE_URL / LLM_API_KEY / LLM_DEFAULT_MODEL say otherwise -
+# see config/settings_local.py.
 
 # --- Model provider -----------------------------------------------------
 requests>=2.31

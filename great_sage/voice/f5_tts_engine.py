@@ -265,10 +265,20 @@ class F5TTSVoiceOutput(VoiceOutput):
         self._preprocess = preprocess_ref_audio_text
         self._nfe_step = nfe_step
 
+        # CLONE_DEVICE: None (auto), "cpu", "cuda", or a GPU index. The
+        # index case is the one a dual-GPU machine needs: the chat model
+        # owns the default GPU, and the voice model has to live on the
+        # other one - "cuda" alone always means GPU 0.
         try:
             import torch
 
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            want = getattr(settings, "CLONE_DEVICE", None)
+            if want is None:
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+            elif want == "cpu" or want == "cuda":
+                device = want
+            else:
+                device = "cuda:%s" % want
         except ImportError:
             device = "cpu"
         try:
@@ -556,13 +566,16 @@ class F5TTSVoiceOutput(VoiceOutput):
             return
         if getattr(data, "ndim", 1) > 1:
             data = data.mean(axis=1)
-        self._play(data, rate)
+        # Synthesized clips arrive tail-padded from generate(); the
+        # recorded lines do not, and with the chain now reset per clip
+        # their reverb/delay tail would be cut at the clip edge. Pad the
+        # same TAIL_PAD_SECONDS so they ring out inside their own clip.
+        self._play(_pad_tail(data, rate), rate)
 
     def speak(self, text: str) -> None:
         if not text or not text.strip():
             return
         self._stop_requested = False
-        self.fx.begin_utterance()
         for kind, payload, spoken in split_voice_lines(
                 text, self._active_voice_lines()):
             if self._stop_requested:
@@ -601,7 +614,6 @@ class F5TTSVoiceOutput(VoiceOutput):
         that one still matches too.
         """
         self._stop_requested = False
-        self.fx.begin_utterance()
         chunk_q: "queue.Queue" = queue.Queue(maxsize=4)
         audio_q: "queue.Queue" = queue.Queue(maxsize=2)
         failure: List[BaseException] = []

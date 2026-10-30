@@ -64,6 +64,17 @@ class PushToTalkRecorder:
         # None means sounddevice's own default input device.
         self.device = None
 
+    @property
+    def running(self) -> bool:
+        """True while a recording is in progress (the stream is open).
+
+        stop() clears the stream BEFORE it transcribes, so this goes
+        False immediately on stop even while the transcription thread
+        is still running - a second toggle press may start a fresh
+        recording without waiting for the previous text.
+        """
+        return self._stream is not None
+
     def start(self) -> None:
         with self._lock:
             if self._stream is not None:

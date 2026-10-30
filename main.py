@@ -8,6 +8,8 @@ interface. To add a new provider later, add a branch here that builds it
 models/base.py don't need to change.
 """
 
+import logging
+import os
 import re
 import sys
 import threading
@@ -17,18 +19,19 @@ from great_sage.config import settings
 from great_sage.core import memory, memory_recall, personality, voice_line_prefs
 from great_sage.core.chat_engine import ChatEngine
 from great_sage.models.base import Message, ModelProvider, ModelProviderError
-from great_sage.models.ollama_provider import OllamaProvider
+from great_sage.models.llama_cpp_provider import LlamaCppProvider
 from great_sage.ui.cli import run_cli
 from great_sage.voice.base import VoiceError
 
 
 def build_provider():
-    if settings.ACTIVE_PROVIDER == "ollama":
-        return OllamaProvider(
-            host=settings.OLLAMA_HOST,
-            model=settings.OLLAMA_DEFAULT_MODEL,
+    if settings.ACTIVE_PROVIDER == "llama_cpp":
+        return LlamaCppProvider(
+            base_url=settings.LLM_BASE_URL,
+            api_key=settings.LLM_API_KEY,
+            model=settings.LLM_DEFAULT_MODEL,
             timeout=settings.REQUEST_TIMEOUT_SECONDS,
-            think=settings.OLLAMA_THINK,
+            think=settings.LLM_THINK,
         )
     raise ValueError(f"Unknown provider: {settings.ACTIVE_PROVIDER}")
 
@@ -239,10 +242,20 @@ def build_voice_lines(set_name=None):
         lines = sets.get(name, [])
     else:
         lines = settings.VOICE_LINES        # older config, no sets defined
-    return [
-        (re.compile(pattern, re.IGNORECASE), path)
-        for pattern, path in lines
-    ]
+    # A clip that was never recorded is not an error: its phrase falls
+    # through to live TTS, exactly as a disabled line does. Without this,
+    # one missing wav took the whole voice down with it - the English set
+    # has no "Notice." clip, so the app started text-only on a machine
+    # with a perfectly good F5-TTS stack.
+    compiled = []
+    for pattern, path in lines:
+        if not os.path.isfile(path):
+            logging.getLogger(__name__).warning(
+                "Voice line clip missing for %r (%s) - that phrase falls "
+                "through to live TTS", pattern, path)
+            continue
+        compiled.append((re.compile(pattern, re.IGNORECASE), path))
+    return compiled
 
 
 def build_voice(provider: ModelProvider):
@@ -340,20 +353,26 @@ def build_voice(provider: ModelProvider):
 def main() -> int:
     provider = build_provider()
 
-    # Fail fast and clearly if Ollama isn't reachable, instead of letting
-    # the user discover it on their first chat message.
+    # Fail fast and clearly if the model server isn't reachable, instead
+    # of letting the user discover it on their first chat message.
     try:
         available = provider.get_available_models()
     except ModelProviderError as exc:
         print(f"[Startup error] {exc}")
         return 1
 
-    if available and settings.OLLAMA_DEFAULT_MODEL not in available:
+    # An empty LLM_DEFAULT_MODEL means "the first model the server
+    # reports" - the provider resolves it lazily, and this is the name
+    # that resolution lands on (get_available_models is sorted).
+    model_name = settings.LLM_DEFAULT_MODEL or (available[0] if available else "")
+
+    if settings.LLM_DEFAULT_MODEL and available \
+            and settings.LLM_DEFAULT_MODEL not in available:
         print(
-            f"[Warning] '{settings.OLLAMA_DEFAULT_MODEL}' was not found in "
-            f"Ollama's pulled models: {', '.join(available)}"
+            f"[Warning] '{settings.LLM_DEFAULT_MODEL}' was not found in "
+            f"the server's models: {', '.join(available)}"
         )
-        print(f"Try: ollama pull {settings.OLLAMA_DEFAULT_MODEL}\n")
+        print("Set LLM_DEFAULT_MODEL in settings.local.py to one of these.\n")
 
     voice = build_voice(provider)
     engine = ChatEngine(
@@ -362,7 +381,7 @@ def main() -> int:
         idle_reset_seconds=settings.SESSION_IDLE_RESET_MINUTES * 60,
         on_session_boundary=build_memory_callback(provider),
     )
-    run_cli(engine, settings.OLLAMA_DEFAULT_MODEL, voice=voice)
+    run_cli(engine, model_name, voice=voice)
     return 0
 
 

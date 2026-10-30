@@ -1,6 +1,9 @@
 # Great Sage
 
-Local-first Windows AI companion (Ollama chat + optional cloned-voice TTS).
+Local-first Linux (Wayland) AI companion (llama.cpp chat + cloned-voice
+TTS). Ported from Windows in October 2026 — the model backend is
+llama.cpp's OpenAI-compatible API (bare `llama-server` on port 8080, or
+a router such as llama-swap via `settings_local.py`), not Ollama.
 Full history, environment quirks, and troubleshooting detail live in
 [NOTES.md](NOTES.md) — read it before touching `voice/` or
 `config/settings.py`. This file is just the short, always-apply version.
@@ -16,8 +19,12 @@ Full history, environment quirks, and troubleshooting detail live in
 
 ## Environment gotchas
 
-- Use `py`, not `python` - the bare `python` command hits the Microsoft
-  Store stub on this machine.
+- Run through the project venv: `.venv/bin/python` - the system Python
+  does not carry the stack. torch must be installed with the CUDA index
+  matching the GPU (cu128 covers RTX 50/Blackwell).
+- Per-machine values (llama-swap URL/key/model) live in
+  `great_sage/config/settings_local.py` - git-ignored, loaded last by
+  `settings.py`, never committed.
 - XTTS-v2 truncates/garbles text past a per-language character limit
   (71 for Japanese, 250 for English, etc.) - always chunk before
   `inference_stream()`. See `_CHAR_LIMITS` in `cloned_voice_engine.py`.
@@ -28,19 +35,19 @@ Full history, environment quirks, and troubleshooting detail live in
 ## Run / test
 
 ```bash
-py app.py          # the real app - HUD, voice, tools
-py main.py         # the old CLI, still works
-py build.py        # packaged exe; runs the checks below first and
-                   # refuses to ship if any fail
+.venv/bin/python app.py          # the real app - HUD, voice, tools
+.venv/bin/python main.py         # the old CLI, still works
+py build.py                      # Windows packaged exe; runs the checks
+                                 # below first and refuses to ship if any fail
 ```
 
 Three checks exist and the build gates on them. Run them after touching
 what they cover:
 
 ```bash
-py check_js.py         # the inline HUD script parses at all
-py check_shaders.py    # GLSL template literals are balanced
-py check_routing.py    # asking it to do something actually does it
+.venv/bin/python check_js.py         # the inline HUD script parses at all
+.venv/bin/python check_shaders.py    # GLSL template literals are balanced
+.venv/bin/python check_routing.py    # asking it to do something actually does it
 ```
 
 `check_routing.py` matters most: the failure it guards is not a crash but

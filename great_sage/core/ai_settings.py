@@ -183,14 +183,14 @@ def build_provider(data, fallback):
     if not _modes.get((data or {}).get("mode")).allow_online and want != "local":
         log.info("PRIVATE mode: staying on the local model rather than %r",
                  want)
-        return fallback, "Ollama / Local (private)"
+        return fallback, "llama.cpp / Local (private)"
     if want == "local":
-        return fallback, "Ollama / Local"
+        return fallback, "llama.cpp / Local"
     key = ((data or {}).get("keys") or {}).get(want, "").strip()
     if not key:
         log.warning("Provider %r selected but no API key is set; "
                     "staying on the local model", want)
-        return fallback, "Ollama / Local"
+        return fallback, "llama.cpp / Local"
     try:
         model = (data or {}).get("chat_model") or ""
         if want == "anthropic":
@@ -204,6 +204,6 @@ def build_provider(data, fallback):
     except Exception:
         # Deliberately no exception text: it can echo request details.
         log.exception("Could not start the %r provider; staying local", want)
-        return fallback, "Ollama / Local"
+        return fallback, "llama.cpp / Local"
     log.warning("Provider %r is not implemented yet; staying local", want)
-    return fallback, "Ollama / Local"
+    return fallback, "llama.cpp / Local"
