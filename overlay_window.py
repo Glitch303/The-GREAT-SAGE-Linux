@@ -86,6 +86,15 @@ class OverlayWindow(QWidget):
         # Load the HUD page in overlay mode
         self.view.load(url)
 
+        # Watch for exit signal from the page
+        self.view.page().titleChanged.connect(self._on_title_changed)
+
+    def _on_title_changed(self, title):
+        """Handle title changes from the page."""
+        if title == EXIT_SENTINEL:
+            print("[overlay] Exit signal received from page", flush=True)
+            self.close()
+
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             self._drag_pos = event.globalPosition().toPoint() - self.pos()
