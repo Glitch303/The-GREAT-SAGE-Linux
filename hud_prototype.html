@@ -5,6 +5,8 @@
 <title>Great Sage HUD Prototype</title>
 <style>
   html, body { margin: 0; padding: 0; background: #030b08; overflow: hidden; height: 100%; }
+  /* Transparent background in overlay/mini mode */
+  body.mini { background: transparent; }
   #canvas-wrap {
     position: fixed; inset: 0;
     transition: filter 380ms ease, transform 380ms ease;
