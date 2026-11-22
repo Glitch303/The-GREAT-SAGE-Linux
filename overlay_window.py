@@ -9,9 +9,10 @@ import argparse
 import os
 import sys
 
-from PySide6.QtCore import Qt, QUrl, QUrlQuery
+from PySide6.QtCore import Qt, QUrl, QUrlQuery, QObject, Slot
 from PySide6.QtWidgets import QApplication, QWidget
 from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWebChannel import QWebChannel
 
 # Frozen, the overlay is its OWN exe (see overlay.spec)
 FROZEN = getattr(sys, "frozen", False)
@@ -39,6 +40,24 @@ MARGIN = 8
 HANDLE_INSET_RIGHT, HANDLE_TOP, HANDLE_W, HANDLE_H = 48, 2, 26, 26
 
 
+class OverlayHost(QObject):
+    """QWebChannel bridge object exposed to JavaScript."""
+
+    def __init__(self, window):
+        super().__init__()
+        self.window = window
+
+    @Slot(bool)
+    def set_overlay(self, enabled):
+        """Called by JavaScript to toggle overlay mode."""
+        print(f"[overlay] set_overlay({enabled}) called from JavaScript", flush=True)
+        if enabled:
+            print("[overlay] set_overlay(true) - already in overlay mode", flush=True)
+        else:
+            print("[overlay] set_overlay(false) - exiting overlay mode", flush=True)
+            self.window.close()
+
+
 class OverlayWindow(QWidget):
     """Frameless, always-on-top, transparent overlay window."""
 
@@ -57,6 +76,12 @@ class OverlayWindow(QWidget):
         self.view.setGeometry(0, 0, size, size)
         self.view.setAttribute(Qt.WA_TranslucentBackground)
         self.view.setStyleSheet("background: transparent;")
+
+        # Set up QWebChannel bridge for host communication
+        self.channel = QWebChannel()
+        self.host = OverlayHost(self)
+        self.channel.registerObject("overlayHost", self.host)
+        self.view.page().setWebChannel(self.channel)
 
         # Load the HUD page in overlay mode
         self.view.load(url)

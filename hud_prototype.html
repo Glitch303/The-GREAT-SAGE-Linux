@@ -3,6 +3,8 @@
 <head>
 <meta charset="utf-8">
 <title>Great Sage HUD Prototype</title>
+<!-- QWebChannel bridge for Wayland overlay host communication -->
+<script src="/usr/share/qt6/webchannel/qwebchannel.js"></script>
 <style>
   html, body { margin: 0; padding: 0; background: #030b08; overflow: hidden; height: 100%; }
   /* Transparent background in overlay/mini mode */
@@ -9244,18 +9246,40 @@ const MINI_CHAT_PAD = 3;
 
   // ---------------- Mini overlay wiring ----------------
 
-  // The native window can only be resized from Python - pywebview owns it
+  // QWebChannel bridge initialization (Wayland overlay)
+  window.overlayHost = null;
+  if (typeof QWebChannel !== 'undefined' && typeof qt !== 'undefined') {
+    new QWebChannel(qt.webChannelTransport, (channel) => {
+      window.overlayHost = channel.objects.overlayHost;
+      console.log('QWebChannel bridge ready:', window.overlayHost);
+    });
+  } else {
+    console.log('QWebChannel not available (not in Qt WebEngine)');
+  }
+
+  // The native window can only be resized from Python - the host owns it
   // and no DOM API reaches it. Calls are made defensively so the page
   // still works opened directly in a browser for development: the visual
   // mode switches, only the window geometry does not.
   function callHost(method) {
     const args = Array.prototype.slice.call(arguments, 1);
+    console.log('callHost:', method, args);
     try {
+      // QWebChannel bridge (Wayland overlay)
+      if (window.overlayHost && typeof window.overlayHost[method] === 'function') {
+        console.log('Using QWebChannel bridge');
+        return window.overlayHost[method].apply(window.overlayHost, args);
+      }
+      // pywebview bridge (Windows/Linux pywebview)
       const api = window.pywebview && window.pywebview.api;
-      if (api && typeof api[method] === 'function') return api[method].apply(api, args);
+      if (api && typeof api[method] === 'function') {
+        console.log('Using pywebview bridge');
+        return api[method].apply(api, args);
+      }
     } catch (err) {
       console.warn('host bridge unavailable:', method, err);
     }
+    console.log('No bridge found for:', method);
     return null;
   }
 
