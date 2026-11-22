@@ -299,6 +299,10 @@ class _HudHostApi:
         overlay_bin = os.path.join(here, "overlay", "great_sage_overlay")
         if os.path.exists(overlay_bin):
             return [overlay_bin, "--size", str(OVERLAY_SIZE)]
+        # Fall back to Python script for development
+        overlay_script = os.path.join(here, "overlay_window.py")
+        if os.path.exists(overlay_script):
+            return [sys.executable, overlay_script, "--size", str(OVERLAY_SIZE)]
         log.info("Overlay host not found at %s - overlay mode is not "
                  "available on Linux yet (Phase 2)", overlay_bin)
         return None
